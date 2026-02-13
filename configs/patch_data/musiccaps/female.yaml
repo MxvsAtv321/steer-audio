@@ -1,0 +1,11 @@
+type: "csv"
+csv_path: "data/female/corrupted_prompts.csv"
+feature: "female"
+prefix_clean: "Female vocal singing. "
+suffix_clean: " Woman voice."
+prefix_corrupted: "Male vocal singing. "
+suffix_corrupted: " Man voice."
+
+eval_clap_prompts:
+  - A female woman singing
+  - A male man singing

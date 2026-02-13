@@ -1,0 +1,15 @@
+type: "csv"
+csv_path: "data/slow/corrupted_prompts.csv"
+feature: "slow"
+prefix_clean: ""
+suffix_clean: ""
+prefix_corrupted: ""
+suffix_corrupted: ""
+
+eval_clap_prompts:
+  - fast song
+  - slow song
+
+eval_muqt_prompts:
+  - fast
+  - slow

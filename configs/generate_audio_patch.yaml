@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - patch_model: audioldm2_patch
+  - patch_config: audioldm2
+  - patch_layers: audioldm2/no_layers
+  - patch_data: example_prompts
+  - paths: default
+  - extras: default
+  - experiment: null
+
+task_name: "generate_with_patch"
+
+tags: ["dev"]

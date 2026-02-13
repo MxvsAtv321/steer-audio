@@ -1,0 +1,10 @@
+type: "csv"
+csv_path: "data/corrupted_prompts.csv"
+feature: "bongos"
+prefix_clean: ""
+suffix_clean: ""
+prefix_corrupted: ""
+suffix_corrupted: ""
+
+eval_clap_prompts:
+  - bongos music
