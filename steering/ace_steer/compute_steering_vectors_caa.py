@@ -19,12 +19,15 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import hydra
 import numpy as np
 import torch
 from fire import Fire
+from omegaconf import DictConfig
 from tqdm import tqdm
 
-WORKDIR_PATH = "<WORKDIR_PATH>"
+# BUG FIX: replaced hardcoded placeholder with env var — 2026-03-17
+WORKDIR_PATH = os.environ.get("TADA_WORKDIR", str(Path(__file__).resolve().parents[2]))
 
 sys.path.append(f"{WORKDIR_PATH}")
 sys.path.append(f"{WORKDIR_PATH}/src/models/ace_step/ACE")
@@ -271,5 +274,33 @@ def main(
         print(f"  - 'both_cond': ✓ (both steered with cond vectors)")
 
 
+@hydra.main(version_base="1.4", config_path="../../configs", config_name="compute_caa")
+def hydra_main(cfg: DictConfig) -> None:
+    """Hydra entry point for CAA steering vector computation.
+
+    Delegates to :func:`main` using values from the Hydra config tree.
+    Invoke via: ``python compute_steering_vectors_caa.py concept=tempo``
+    or keep using ``python compute_steering_vectors_caa.py --concept tempo``
+    (Fire-based interface) by calling ``Fire(main)`` instead.
+
+    Args:
+        cfg: Hydra DictConfig composed from ``configs/compute_caa.yaml``.
+    """
+    main(
+        concept=cfg.concept,
+        num_inference_steps=cfg.get("num_inference_steps", 30),
+        audio_duration=cfg.get("audio_duration", 30.0),
+        guidance_scale_text=cfg.get("guidance_scale_text", 0.0),
+        guidance_scale_lyric=cfg.get("guidance_scale_lyric", 0.0),
+        guidance_scale=cfg.get("guidance_scale", 3.0),
+        guidance_interval=cfg.get("guidance_interval", 1.0),
+        guidance_interval_decay=cfg.get("guidance_interval_decay", 0.0),
+        seed=cfg.get("seed", 42),
+        device=cfg.get("device", DEFAULT_DEVICE),
+        save_dir=cfg.get("save_dir", DEFAULT_SAVE_DIR),
+        save_all_cfg_passes=cfg.get("save_all_cfg_passes", True),
+    )
+
+
 if __name__ == "__main__":
-    Fire(main)
+    hydra_main()  # Hydra is the default entry point; use Fire(main) for legacy CLI

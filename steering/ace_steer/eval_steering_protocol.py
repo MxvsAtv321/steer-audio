@@ -59,7 +59,8 @@ def _patched_torch_load(*args, **kwargs):
 
 torch.load = _patched_torch_load
 
-WORKDIR_PATH = "<WORKDIR_PATH>"
+# BUG FIX: replaced hardcoded placeholder with env var — 2026-03-17
+WORKDIR_PATH = os.environ.get("TADA_WORKDIR", str(Path(__file__).resolve().parents[2]))
 sys.path.append(f"{WORKDIR_PATH}")
 sys.path.append(f"{WORKDIR_PATH}/src/models/ace_step/ACE")
 sys.path.append(f"{WORKDIR_PATH}/sae")

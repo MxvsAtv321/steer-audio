@@ -2,7 +2,8 @@
 
 ACCOUNT="<SLURM_ACCOUNT>"
 PARTITION="<SLURM_PARTITION>"
-WORKDIR_PATH="<WORKDIR_PATH>"
+WORKDIR_PATH="${TADA_WORKDIR:-$HOME/tada_outputs}"
+# BUG FIX: replaced hardcoded placeholder with env var — 2026-03-17
 OUTPUTS_PATH="./outputs"
 MODEL_NAME="stableaudio"
 

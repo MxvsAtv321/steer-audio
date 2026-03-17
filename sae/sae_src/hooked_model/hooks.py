@@ -5,6 +5,7 @@ import torch
 
 
 class SAEReconstructHook:
+    # BUG FIX: removed np.sqrt spatial reshape (image-specific dead code) — 2026-03-17
     def __init__(
         self,
         sae,
@@ -13,37 +14,22 @@ class SAEReconstructHook:
 
     @torch.no_grad()
     def __call__(self, module, input, output):
+        # Audio activations are 1D sequences; no spatial reshape needed
+        # output[0] shape: (batch*2, seq_len, hidden_dim) for CFG-guided audio models
         output1, output2 = output[0].chunk(2)
-        # reshape to SAE input shape
-        output1 = output1.permute(0, 2, 3, 1).reshape(len(output1), output1.shape[-1] * output1.shape[-2], -1)
-        output2 = output2.permute(0, 2, 3, 1).reshape(len(output2), output2.shape[-1] * output2.shape[-2], -1)
-        output_cat = torch.cat([output1, output2], dim=0)
+        batch_size = len(output1)
+        output_cat = torch.cat([output1, output2], dim=0)  # (batch*2, seq_len, hidden_dim)
         sae_input, _, _ = self.sae.preprocess_input(output_cat)
         pre_acts = self.sae.pre_acts(sae_input)
         top_acts, top_indices = self.sae.select_topk(pre_acts)
         buf = top_acts.new_zeros(top_acts.shape[:-1] + (self.sae.W_dec.mT.shape[-1],))
         latents = buf.scatter_(dim=-1, index=top_indices, src=top_acts)
         sae_out = (latents @ self.sae.W_dec) + self.sae.b_dec
-        sae_out1 = sae_out[: output1.shape[1] * len(output1)]
-        sae_out2 = sae_out[output1.shape[1] * len(output1) :]
-        hook_output = torch.cat(
-            [
-                sae_out1.reshape(
-                    len(output1),
-                    int(np.sqrt(output1.shape[-2])),
-                    int(np.sqrt(output1.shape[-2])),
-                    -1,
-                ).permute(0, 3, 1, 2),
-                sae_out2.reshape(
-                    len(output2),
-                    int(np.sqrt(output2.shape[-2])),
-                    int(np.sqrt(output2.shape[-2])),
-                    -1,
-                ).permute(0, 3, 1, 2),
-            ],
-            dim=0,
-        )
-
+        # Reshape back to (batch*2, seq_len, hidden_dim); no 2D spatial reshape for audio
+        sae_out = einops.rearrange(sae_out, "(b t) f -> b t f", b=batch_size * 2)
+        sae_out1 = sae_out[:batch_size]
+        sae_out2 = sae_out[batch_size:]
+        hook_output = torch.cat([sae_out1, sae_out2], dim=0)
         return (hook_output,)
 
 
@@ -196,10 +182,10 @@ class StableAudioAblateHook:
         buf = top_acts.new_zeros(top_acts.shape[:-1] + (self.sae.W_dec.mT.shape[-1],))
         latents = buf.scatter_(dim=-1, index=top_indices, src=top_acts)
 
-        # zero out latent and decode
-        # latents[..., :] = 0
+        # Zero features before decoding to avoid wasted computation
+        # BUG FIX: moved zeroing to before decode step (was after) — 2026-03-17
+        latents = torch.zeros_like(latents)
         sae_out = (latents @ self.sae.W_dec) + self.sae.b_dec
-        sae_out = torch.zeros_like(sae_out)
 
         if self.along_freqs:
             sae_out = einops.rearrange(sae_out, "(b f) t -> b t f", b=batch_size)

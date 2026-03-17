@@ -10,8 +10,10 @@ class SaeConfig(Serializable):
     Configuration for training a sparse autoencoder on a language model.
     """
 
-    expansion_factor: int = 32
+    expansion_factor: int = 4
     """Multiple of the input dimension to use as the SAE dimension."""
+    # Paper values: m=4, k=64 (arXiv 2602.11910 Table 3)
+    # BUG FIX: expansion_factor changed from 32 to 4 to match paper defaults — 2026-03-17
 
     normalize_decoder: bool = True
     """Normalize the decoder weights to have unit norm."""
@@ -19,8 +21,9 @@ class SaeConfig(Serializable):
     num_latents: int = 0
     """Number of latents to use. If 0, use `expansion_factor`."""
 
-    k: int = 32
+    k: int = 64
     """Number of nonzero features."""
+    # BUG FIX: k changed from 32 to 64 to match paper defaults — 2026-03-17
 
     batch_topk: bool = False
     """Train Batch-TopK SAEs"""
@@ -109,6 +112,14 @@ class TrainConfig(Serializable):
 
 @dataclass
 class CacheActivationsRunnerConfig:
+    """
+    Configuration for caching model activations used in SAE training.
+
+    This config is for ACE-Step only. For AudioLDM2 or Stable Audio, use
+    the corresponding runner configs in their respective scripts.
+    All paths are relative to the working directory unless absolute.
+    """
+
     hook_names: list[str] | None = None
     new_cached_activations_path: str | None = None
     dataset_type: str | None = None
@@ -118,7 +129,8 @@ class CacheActivationsRunnerConfig:
     split: str = "train"
     column: str = "caption"
     device: torch.device | str = "cuda"
-    model_name: str = "sd-legacy/stable-diffusion-v1-5"
+    # BUG FIX: model_name changed from sd-legacy/stable-diffusion-v1-5 to ACE-Step — 2026-03-17
+    model_name: str = "acestep/ace-step-v1"
     flatten_act_freq: bool = False
     arbitrary_F_dims: list[int] | None = None
     dtype: torch.dtype = torch.float16
@@ -128,7 +140,8 @@ class CacheActivationsRunnerConfig:
     num_workers: int = 8
     max_num_examples: int | None = None
     cache_every_n_timesteps: int = 1
-    guidance_scale: float = 9.0
+    # BUG FIX: guidance_scale changed from 9.0 to 7.5 (standard audio diffusion default) — 2026-03-17
+    guidance_scale: float = 7.5
     audio_length_in_s: float | None = None
     num_waveforms_per_prompt: int | None = None
     hf_repo_id: str | None = None

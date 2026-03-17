@@ -2,7 +2,8 @@
 
 ACCOUNT="<SLURM_ACCOUNT>"
 PARTITION="<SLURM_PARTITION>"
-WORKDIR_PATH="<WORKDIR_PATH>"
+WORKDIR_PATH="${TADA_WORKDIR:-$HOME/tada_outputs}"
+# BUG FIX: replaced hardcoded placeholder with env var — 2026-03-17
 MODEL_NAME="stableaudio"
 
 BLOCKS_TO_PATCH=("tf0" "tf1" "tf2" "tf3" "tf4" "tf5" "tf6" "tf7" "tf8" "tf9" "tf10" "tf11" "tf12" "tf13" "tf14" "tf15" "tf16" "tf17" "tf18" "tf19" "tf20" "tf21" "tf22" "tf23" "none" "all")

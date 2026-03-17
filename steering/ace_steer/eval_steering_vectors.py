@@ -26,7 +26,8 @@ import torchaudio
 from fire import Fire
 from tqdm import tqdm
 
-WORKDIR_PATH = "<WORKDIR_PATH>"
+# BUG FIX: replaced hardcoded placeholder with env var — 2026-03-17
+WORKDIR_PATH = os.environ.get("TADA_WORKDIR", str(Path(__file__).resolve().parents[2]))
 sys.path.append(f"{WORKDIR_PATH}")
 sys.path.append(f"{WORKDIR_PATH}/src/models/ace_step/ACE")
 sys.path.append(f"{WORKDIR_PATH}/sae")
@@ -237,7 +238,8 @@ def main(
 
     # Setup save directory
     if save_dir is None:
-        save_dir = f"/data/lstaniszewski/code/audio-interv/steering/outputs/{concept}/{steer_mode}/{layers}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        # BUG FIX: replaced hardcoded absolute path with env-var-based path — 2026-03-17
+        save_dir = str(Path(os.environ.get("TADA_WORKDIR", str(Path(__file__).resolve().parents[2]))) / "steering" / "outputs" / concept / steer_mode / f"{layers}_{datetime.now().strftime('%Y%m%d%H%M%S')}")
     os.makedirs(save_dir, exist_ok=True)
     print(f"Saving outputs to {save_dir}")
 
