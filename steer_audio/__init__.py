@@ -8,6 +8,7 @@ Provides:
   - constant_schedule / cosine_schedule  (temporal_steering)
   - early_only_schedule / late_only_schedule / linear_schedule  (temporal_steering)
   - ConceptFeatureSet / ConceptAlgebra   (concept_algebra)
+  - ConceptProbe / SelfMonitoredSteerer  (self_monitor)
 """
 
 from steer_audio.vector_bank import SteeringVector, SteeringVectorBank  # noqa: F401
@@ -27,3 +28,4 @@ from steer_audio.concept_algebra import (  # noqa: F401
     AlgebraPreset,
     AlgebraPresetBank,
 )
+from steer_audio.self_monitor import ConceptProbe, SelfMonitoredSteerer  # noqa: F401
