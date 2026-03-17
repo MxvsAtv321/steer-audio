@@ -1,0 +1,11 @@
+{
+  "name": "fast_tempo_minus_drums",
+  "expression": "fast_tempo - drums",
+  "description": "fast but without drums",
+  "tags": [
+    "demo",
+    "phase2.3"
+  ],
+  "created_at": "2026-03-17T23:31:19.242240+00:00",
+  "author": ""
+}

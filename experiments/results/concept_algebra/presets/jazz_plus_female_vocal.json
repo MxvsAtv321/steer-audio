@@ -1,0 +1,11 @@
+{
+  "name": "jazz_plus_female_vocal",
+  "expression": "jazz + female_vocal",
+  "description": "jazz with female vocals",
+  "tags": [
+    "demo",
+    "phase2.3"
+  ],
+  "created_at": "2026-03-17T23:31:19.241973+00:00",
+  "author": ""
+}

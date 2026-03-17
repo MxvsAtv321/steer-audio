@@ -40,7 +40,12 @@ for _p in [str(_REPO_ROOT), str(_SAE_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from steer_audio.concept_algebra import ConceptAlgebra, ConceptFeatureSet
+from steer_audio.concept_algebra import (
+    ConceptAlgebra,
+    ConceptFeatureSet,
+    AlgebraPreset,
+    AlgebraPresetBank,
+)
 from steer_audio.vector_bank import SteeringVectorBank
 
 log = logging.getLogger(__name__)
@@ -468,6 +473,47 @@ def main() -> None:
     print("=" * 70)
 
     bank = SteeringVectorBank()
+
+    # ------------------------------------------------------------------ #
+    # Preset demo: save all 5 expressions as named presets, list them,
+    # then reload one to prove round-trip serialisation works.
+    # ------------------------------------------------------------------ #
+    preset_bank = AlgebraPresetBank()
+    preset_dir = args.out_dir / "presets"
+    preset_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n--- Saving algebra presets ---")
+    for demo in DEMO_EXPRESSIONS:
+        safe_name = (
+            demo["expr"]
+            .replace(" ", "_")
+            .replace("*", "x")
+            .replace(".", "p")
+            .replace("+", "plus")
+            .replace("-", "minus")
+            .replace("&", "and")
+        )
+        preset = AlgebraPreset(
+            name=safe_name,
+            expression=demo["expr"],
+            description=demo["description"],
+            tags=["demo", "phase2.3"],
+        )
+        out_json = preset_bank.save(preset, preset_dir)
+        print(f"  Saved preset: {preset.name} → {out_json.name}")
+
+    all_presets = preset_bank.list_all(preset_dir)
+    print(f"\nListed {len(all_presets)} preset(s) from {preset_dir}:")
+    print(preset_bank.summary_table(all_presets))
+
+    # Round-trip: reload the first preset and evaluate it.
+    first_preset_name = list(all_presets.keys())[0]
+    reloaded = preset_bank.load(preset_dir / f"{first_preset_name}.json")
+    rt_cfs = reloaded.evaluate(algebra)
+    print(
+        f"Round-trip check: preset '{reloaded.name}' → "
+        f"{len(rt_cfs.feature_indices)} features.\n"
+    )
 
     for i, demo in enumerate(DEMO_EXPRESSIONS, start=1):
         expr_str = demo["expr"]

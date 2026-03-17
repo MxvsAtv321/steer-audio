@@ -21,4 +21,9 @@ from steer_audio.temporal_steering import (  # noqa: F401
     late_only_schedule,
     linear_schedule,
 )
-from steer_audio.concept_algebra import ConceptFeatureSet, ConceptAlgebra  # noqa: F401
+from steer_audio.concept_algebra import (  # noqa: F401
+    ConceptFeatureSet,
+    ConceptAlgebra,
+    AlgebraPreset,
+    AlgebraPresetBank,
+)

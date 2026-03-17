@@ -13,14 +13,20 @@ Mathematical foundation (arXiv 2602.11910 §3.3):
   Intersection (A & B): F_A ∩ F_B → use min of scores
   Weighted (0.7*A): scale all TF-IDF scores by 0.7
 
+Also provides AlgebraPreset / AlgebraPresetBank for saving, loading, and
+listing named algebra expressions so they can be shared and reproduced across
+sessions without re-typing expression strings.
+
 Reference: TADA roadmap Prompt 2.3.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import matplotlib
@@ -604,3 +610,243 @@ class ConceptAlgebra:
 
         fig.tight_layout()
         return fig
+
+
+# ---------------------------------------------------------------------------
+# AlgebraPreset — named, serialisable algebra expression
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AlgebraPreset:
+    """A named, serialisable algebra expression with provenance metadata.
+
+    An ``AlgebraPreset`` stores a concept-algebra expression string (e.g.
+    ``"0.7 * jazz + 0.3 * reggae"``) together with human-readable context so
+    that results can be reproduced, shared, and listed without re-typing the
+    original expression.
+
+    Attributes:
+        name:        Short identifier used as the file stem and dict key,
+                     e.g. ``"jazz_reggae_blend"``.
+        expression:  Algebra expression string as accepted by
+                     :meth:`ConceptAlgebra.expr`.
+        description: Human-readable description of what the preset does.
+        tags:        Optional list of category tags (e.g. ``["genre", "blend"]``).
+        created_at:  ISO-8601 creation timestamp (auto-set on construction).
+        author:      Optional author / provenance string.
+    """
+
+    name: str
+    expression: str
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    author: str = ""
+
+    def evaluate(self, algebra: ConceptAlgebra) -> ConceptFeatureSet:
+        """Evaluate the preset expression using *algebra*.
+
+        Args:
+            algebra: :class:`ConceptAlgebra` instance loaded with the relevant
+                     concept feature sets.
+
+        Returns:
+            :class:`ConceptFeatureSet` resulting from the expression.
+
+        Raises:
+            ValueError: On parse / syntax errors in :attr:`expression`.
+            KeyError:   If a concept name in :attr:`expression` is not in
+                        *algebra*.
+        """
+        return algebra.expr(self.expression)
+
+
+# ---------------------------------------------------------------------------
+# AlgebraPresetBank — save / load / list named presets
+# ---------------------------------------------------------------------------
+
+
+class AlgebraPresetBank:
+    """Registry for named :class:`AlgebraPreset` objects.
+
+    Presets are serialised as individual JSON files inside a directory so that
+    each preset file is human-readable, diff-friendly, and independently
+    version-controllable.
+
+    Example::
+
+        bank = AlgebraPresetBank()
+        preset = AlgebraPreset(
+            name="jazz_reggae_blend",
+            expression="0.5 * jazz + 0.5 * reggae",
+            description="Equal-weight jazz-reggae hybrid",
+            tags=["genre", "blend"],
+        )
+        bank.save(preset, Path("presets"))
+        loaded = bank.load(Path("presets/jazz_reggae_blend.json"))
+        all_presets = bank.list_all(Path("presets"))
+    """
+
+    _SUFFIX: str = ".json"
+
+    # ------------------------------------------------------------------ #
+    # Save
+    # ------------------------------------------------------------------ #
+
+    def save(self, preset: AlgebraPreset, directory: Path) -> Path:
+        """Serialise *preset* to ``{directory}/{preset.name}.json``.
+
+        Args:
+            preset:    The preset to save.
+            directory: Destination directory (created if it does not exist).
+
+        Returns:
+            The :class:`~pathlib.Path` of the written JSON file.
+
+        Raises:
+            ValueError: If ``preset.name`` contains characters that make an
+                        invalid filename (e.g. path separators).
+        """
+        directory = Path(directory)
+        # Guard against name values that would escape the directory.
+        if "/" in preset.name or "\\" in preset.name:
+            raise ValueError(
+                f"AlgebraPreset name {preset.name!r} must not contain path "
+                "separators ('/' or '\\')."
+            )
+        directory.mkdir(parents=True, exist_ok=True)
+        out_path = directory / f"{preset.name}{self._SUFFIX}"
+        data = asdict(preset)
+        out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.debug("Saved AlgebraPreset %r to %s", preset.name, out_path)
+        return out_path
+
+    # ------------------------------------------------------------------ #
+    # Load single
+    # ------------------------------------------------------------------ #
+
+    def load(self, path: Path) -> AlgebraPreset:
+        """Load an :class:`AlgebraPreset` from a JSON file written by :meth:`save`.
+
+        Args:
+            path: Path to a ``.json`` preset file.
+
+        Returns:
+            Reconstructed :class:`AlgebraPreset`.
+
+        Raises:
+            FileNotFoundError: If *path* does not exist.
+            ValueError:        If the JSON cannot be parsed or is missing
+                               required fields.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"AlgebraPreset file not found: {path}")
+        try:
+            data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Could not parse AlgebraPreset JSON at {path}: {exc}"
+            ) from exc
+        # Validate required fields.
+        for required in ("name", "expression"):
+            if required not in data:
+                raise ValueError(
+                    f"AlgebraPreset JSON at {path} is missing required field {required!r}."
+                )
+        return AlgebraPreset(**{k: v for k, v in data.items() if k in AlgebraPreset.__dataclass_fields__})
+
+    # ------------------------------------------------------------------ #
+    # Load all
+    # ------------------------------------------------------------------ #
+
+    def list_all(self, directory: Path) -> dict[str, AlgebraPreset]:
+        """Load every ``.json`` preset file in *directory*.
+
+        Args:
+            directory: Directory to scan.
+
+        Returns:
+            Mapping ``preset.name → AlgebraPreset``, sorted by name.
+            Files that cannot be parsed are logged as warnings and skipped.
+        """
+        directory = Path(directory)
+        result: dict[str, AlgebraPreset] = {}
+        for p in sorted(directory.glob(f"*{self._SUFFIX}")):
+            try:
+                preset = self.load(p)
+                result[preset.name] = preset
+                log.debug("Listed preset %r from %s", preset.name, p)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Failed to load preset from %s: %s", p, exc)
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Delete
+    # ------------------------------------------------------------------ #
+
+    def delete(self, name: str, directory: Path) -> bool:
+        """Delete the preset file for *name* from *directory*.
+
+        Args:
+            name:      Preset name (without ``.json`` suffix).
+            directory: Directory where the preset was saved.
+
+        Returns:
+            ``True`` if the file existed and was deleted, ``False`` if it was
+            not found (so callers can treat a missing preset as a no-op).
+        """
+        path = Path(directory) / f"{name}{self._SUFFIX}"
+        if path.exists():
+            path.unlink()
+            log.debug("Deleted AlgebraPreset %r (%s)", name, path)
+            return True
+        log.debug("AlgebraPreset %r not found in %s; nothing deleted.", name, directory)
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Summary
+    # ------------------------------------------------------------------ #
+
+    def summary_table(self, presets: dict[str, AlgebraPreset]) -> str:
+        """Return a formatted table of loaded presets.
+
+        Args:
+            presets: Mapping returned by :meth:`list_all`.
+
+        Returns:
+            Multi-line string suitable for console output.  Uses ``rich`` when
+            available, falls back to plain text otherwise.
+        """
+        try:
+            import io
+            from rich.console import Console
+            from rich.table import Table
+
+            table = Table(title="Algebra Preset Bank")
+            table.add_column("Name", style="cyan")
+            table.add_column("Expression")
+            table.add_column("Description")
+            table.add_column("Tags")
+            table.add_column("Created")
+
+            for name, preset in sorted(presets.items()):
+                table.add_row(
+                    name,
+                    preset.expression,
+                    preset.description[:50] + ("…" if len(preset.description) > 50 else ""),
+                    ", ".join(preset.tags) if preset.tags else "—",
+                    preset.created_at[:10],
+                )
+
+            buf = io.StringIO()
+            Console(file=buf, no_color=False).print(table)
+            return buf.getvalue()
+        except ImportError:
+            lines = ["Algebra Preset Bank", "-" * 60]
+            for name, preset in sorted(presets.items()):
+                lines.append(f"  {name:30s}  expr={preset.expression!r}")
+            return "\n".join(lines)

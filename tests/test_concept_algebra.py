@@ -7,6 +7,7 @@ synthetically so no GPU or checkpoint files are needed.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -19,7 +20,12 @@ for _p in [str(_REPO_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from steer_audio.concept_algebra import ConceptAlgebra, ConceptFeatureSet
+from steer_audio.concept_algebra import (
+    ConceptAlgebra,
+    ConceptFeatureSet,
+    AlgebraPreset,
+    AlgebraPresetBank,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -462,3 +468,192 @@ def test_from_sae_transposes_decoder():
         _HIDDEN_DIM,
         _NUM_FEATURES,
     ), f"Expected ({_HIDDEN_DIM}, {_NUM_FEATURES}), got {cfs.decoder_matrix.shape}"
+
+
+# ---------------------------------------------------------------------------
+# 11. AlgebraPreset — construction and metadata
+# ---------------------------------------------------------------------------
+
+
+def test_preset_defaults():
+    """AlgebraPreset sets created_at automatically and defaults to empty tags."""
+    preset = AlgebraPreset(name="test", expression="jazz + drums")
+    assert preset.created_at  # non-empty ISO string
+    assert preset.tags == []
+    assert preset.description == ""
+    assert preset.author == ""
+
+
+def test_preset_evaluate(algebra, cfs_jazz, cfs_drums):
+    """AlgebraPreset.evaluate delegates to ConceptAlgebra.expr."""
+    preset = AlgebraPreset(
+        name="jazz_drums",
+        expression="jazz + drums",
+        description="Jazz with drums",
+    )
+    result = preset.evaluate(algebra)
+    expected = set(cfs_jazz.feature_indices.tolist()) | set(cfs_drums.feature_indices.tolist())
+    assert set(result.feature_indices.tolist()) == expected
+
+
+def test_preset_evaluate_unknown_concept_raises(algebra):
+    """AlgebraPreset.evaluate raises KeyError for unknown concept names."""
+    preset = AlgebraPreset(name="bad", expression="jazz + unknown_concept")
+    with pytest.raises(KeyError):
+        preset.evaluate(algebra)
+
+
+# ---------------------------------------------------------------------------
+# 12. AlgebraPresetBank — save / load / list_all / delete
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def preset_dir(tmp_path) -> Path:
+    """Temporary directory for preset files."""
+    return tmp_path / "presets"
+
+
+@pytest.fixture
+def sample_preset() -> AlgebraPreset:
+    return AlgebraPreset(
+        name="jazz_reggae_blend",
+        expression="0.5 * jazz + 0.5 * reggae",
+        description="Equal-weight jazz-reggae hybrid",
+        tags=["genre", "blend"],
+        author="test_suite",
+    )
+
+
+def test_preset_bank_save_creates_file(preset_dir, sample_preset):
+    """save() writes a JSON file named after the preset."""
+    bank = AlgebraPresetBank()
+    out = bank.save(sample_preset, preset_dir)
+    assert out.exists(), "save() should create the JSON file."
+    assert out.suffix == ".json"
+    assert out.stem == sample_preset.name
+
+
+def test_preset_bank_save_round_trip(preset_dir, sample_preset):
+    """load() restores all fields saved by save()."""
+    bank = AlgebraPresetBank()
+    bank.save(sample_preset, preset_dir)
+    loaded = bank.load(preset_dir / f"{sample_preset.name}.json")
+    assert loaded.name == sample_preset.name
+    assert loaded.expression == sample_preset.expression
+    assert loaded.description == sample_preset.description
+    assert loaded.tags == sample_preset.tags
+    assert loaded.author == sample_preset.author
+    assert loaded.created_at == sample_preset.created_at
+
+
+def test_preset_bank_load_missing_file(preset_dir):
+    """load() raises FileNotFoundError for a missing file."""
+    bank = AlgebraPresetBank()
+    with pytest.raises(FileNotFoundError):
+        bank.load(preset_dir / "nonexistent.json")
+
+
+def test_preset_bank_load_invalid_json(tmp_path):
+    """load() raises ValueError when the file is not valid JSON."""
+    bad_file = tmp_path / "bad.json"
+    bad_file.write_text("not valid json", encoding="utf-8")
+    bank = AlgebraPresetBank()
+    with pytest.raises(ValueError, match="Could not parse"):
+        bank.load(bad_file)
+
+
+def test_preset_bank_load_missing_required_field(tmp_path):
+    """load() raises ValueError when required field 'expression' is absent."""
+    incomplete = tmp_path / "incomplete.json"
+    incomplete.write_text(json.dumps({"name": "oops"}), encoding="utf-8")
+    bank = AlgebraPresetBank()
+    with pytest.raises(ValueError, match="missing required field"):
+        bank.load(incomplete)
+
+
+def test_preset_bank_list_all_empty_dir(preset_dir):
+    """list_all() returns empty dict for a directory with no JSON files."""
+    preset_dir.mkdir(parents=True, exist_ok=True)
+    bank = AlgebraPresetBank()
+    result = bank.list_all(preset_dir)
+    assert result == {}
+
+
+def test_preset_bank_list_all_multiple(preset_dir):
+    """list_all() returns all saved presets keyed by name."""
+    bank = AlgebraPresetBank()
+    p1 = AlgebraPreset(name="alpha", expression="jazz")
+    p2 = AlgebraPreset(name="beta", expression="drums")
+    bank.save(p1, preset_dir)
+    bank.save(p2, preset_dir)
+
+    result = bank.list_all(preset_dir)
+    assert set(result.keys()) == {"alpha", "beta"}
+    assert result["alpha"].expression == "jazz"
+    assert result["beta"].expression == "drums"
+
+
+def test_preset_bank_delete_existing(preset_dir, sample_preset):
+    """delete() removes the file and returns True."""
+    bank = AlgebraPresetBank()
+    bank.save(sample_preset, preset_dir)
+    deleted = bank.delete(sample_preset.name, preset_dir)
+    assert deleted is True
+    assert not (preset_dir / f"{sample_preset.name}.json").exists()
+
+
+def test_preset_bank_delete_nonexistent(preset_dir):
+    """delete() returns False (not an error) when the preset does not exist."""
+    preset_dir.mkdir(parents=True, exist_ok=True)
+    bank = AlgebraPresetBank()
+    result = bank.delete("no_such_preset", preset_dir)
+    assert result is False
+
+
+def test_preset_bank_name_with_path_separator_raises(preset_dir):
+    """save() raises ValueError if preset.name contains path separators."""
+    bank = AlgebraPresetBank()
+    bad = AlgebraPreset(name="a/b", expression="jazz")
+    with pytest.raises(ValueError, match="path separators"):
+        bank.save(bad, preset_dir)
+
+
+def test_preset_bank_summary_table_returns_string(preset_dir, sample_preset):
+    """summary_table() returns a non-empty string."""
+    bank = AlgebraPresetBank()
+    bank.save(sample_preset, preset_dir)
+    loaded = bank.list_all(preset_dir)
+    table = bank.summary_table(loaded)
+    assert isinstance(table, str) and len(table) > 0
+
+
+def test_preset_bank_list_skips_corrupt_file(preset_dir, sample_preset):
+    """list_all() logs a warning and skips unreadable JSON files."""
+    bank = AlgebraPresetBank()
+    bank.save(sample_preset, preset_dir)
+    # Plant a corrupt file alongside the valid one.
+    (preset_dir / "corrupt.json").write_text("{bad json", encoding="utf-8")
+    result = bank.list_all(preset_dir)
+    # Only the valid preset should appear.
+    assert sample_preset.name in result
+    assert "corrupt" not in result
+
+
+def test_preset_evaluate_and_to_sv_pipeline(preset_dir, algebra):
+    """End-to-end: save preset → load → evaluate → to_steering_vector."""
+    bank = AlgebraPresetBank()
+    preset = AlgebraPreset(
+        name="jazz_minus_techno",
+        expression="jazz - techno",
+        description="Jazz without techno features",
+    )
+    bank.save(preset, preset_dir)
+    loaded = bank.load(preset_dir / "jazz_minus_techno.json")
+
+    cfs_result = loaded.evaluate(algebra)
+    sv = algebra.to_steering_vector(cfs_result)
+
+    from steer_audio.vector_bank import SteeringVector
+    assert isinstance(sv, SteeringVector)
+    assert sv.method == "sae"
