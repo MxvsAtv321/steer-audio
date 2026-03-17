@@ -1,0 +1,25 @@
+# Concept configuration: VOCAL GENDER
+# Positive class = female vocals; negative class = male vocals.
+
+name: vocal_gender
+
+positive_keywords:
+  - female vocals
+  - woman singing
+  - soprano
+
+negative_keywords:
+  - male vocals
+  - man singing
+  - baritone
+
+# Number of top SAE features (τ).
+tau: 20
+
+alpha_range:
+  start: -100
+  stop: 100
+  step: 10
+
+# MUQ-T better captures perceptual vocal gender difference than CLAP.
+similarity_metric: muq

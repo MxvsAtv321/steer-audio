@@ -1,0 +1,28 @@
+# Concept configuration: INSTRUMENTS
+# Covers multiple instrument concepts; use the 'instrument' override key to select one.
+# Default positive = with drums; negative = without (plain instrumental).
+
+name: instruments
+
+positive_keywords:
+  - with drums
+  - with piano
+  - with guitar
+  - with violin
+  - with flute
+
+negative_keywords:
+  - without drums
+  - no drums
+  - without piano
+  - no piano
+
+# Number of top SAE features (τ).
+tau: 20
+
+alpha_range:
+  start: -100
+  stop: 100
+  step: 10
+
+similarity_metric: clap

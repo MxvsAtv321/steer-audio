@@ -1,0 +1,30 @@
+# Experiment configuration: CAA STEERING VECTOR COMPUTATION
+# Used by steering/ace_steer/compute_steering_vectors_caa.py.
+
+name: caa_steering
+
+# Number of diffusion steps used when collecting activations for CAA.
+num_inference_steps: 30
+
+# Audio duration (seconds) for activation collection.
+audio_duration: 30.0
+
+# CFG / guidance settings for ACE-Step.
+guidance_scale: 3.0
+guidance_scale_text: 0.0
+guidance_scale_lyric: 0.0
+guidance_interval: 1.0
+guidance_interval_decay: 0.0
+
+# Random seed for latent initialisation.
+seed: 42
+
+# If true, save activations for ALL CFG passes (cond + uncond).
+# Required for 'separate' steering mode; optional for 'cond_only'.
+save_all_cfg_passes: true
+
+# Directory (relative to workdir) where computed vectors are saved.
+save_dir: steering_vectors
+
+# Output sub-directory relative to workdir.
+output_subdir: caa_steering

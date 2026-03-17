@@ -1,0 +1,25 @@
+# Concept configuration: GENRE
+# Default positive = jazz; negative = non-jazz (generic music prompt).
+
+name: genre
+
+positive_keywords:
+  - jazz
+  - reggae
+  - techno
+  - blues
+
+negative_keywords:
+  - pop
+  - generic music
+  - background music
+
+# Number of top SAE features (τ).
+tau: 20
+
+alpha_range:
+  start: -100
+  stop: 100
+  step: 10
+
+similarity_metric: clap

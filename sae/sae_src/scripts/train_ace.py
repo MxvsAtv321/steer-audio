@@ -8,9 +8,11 @@ from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+import hydra
 import torch
 import torch.distributed as dist
 from datasets import Dataset, concatenate_datasets
+from omegaconf import DictConfig
 from simple_parsing import parse
 
 from sae_src.sae.config import SaeConfig, TrainConfig
@@ -154,5 +156,22 @@ def run():
         trainer.fit()
 
 
-if __name__ == "__main__":
+@hydra.main(version_base="1.4", config_path="../../../configs", config_name="sae_train")
+def hydra_main(cfg: DictConfig) -> None:
+    """Hydra entry point for SAE training on ACE-Step activations.
+
+    Delegates to :func:`run`, which internally uses ``simple_parsing`` to build
+    :class:`ACERunConfig` from command-line arguments.  Full Hydra-native config
+    mapping is a TODO — for now this decorator registers the script in the unified
+    config system while preserving the existing ``simple_parsing``-based interface.
+
+    Args:
+        cfg: Hydra DictConfig composed from ``configs/sae_train.yaml``.
+
+    TODO: map cfg fields onto ACERunConfig to enable full Hydra override support.
+    """
     run()
+
+
+if __name__ == "__main__":
+    run()  # Keep simple_parsing-based entry point as the default for DDP launches

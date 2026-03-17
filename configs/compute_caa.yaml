@@ -1,0 +1,21 @@
+# Root Hydra config for steering/ace_steer/compute_steering_vectors_caa.py
+# Usage: python compute_steering_vectors_caa.py concept=tempo
+
+defaults:
+  - _self_
+  - concept: tempo   # default concept; override with concept=<name>
+
+# Required: concept name must be a key in CONCEPT_TO_PROMPTS.
+# Overridden by the concept config group above.
+concept: ???
+
+num_inference_steps: 30
+audio_duration: 30.0
+guidance_scale: 3.0
+guidance_scale_text: 0.0
+guidance_scale_lyric: 0.0
+guidance_interval: 1.0
+guidance_interval_decay: 0.0
+seed: 42
+save_dir: steering_vectors
+save_all_cfg_passes: true

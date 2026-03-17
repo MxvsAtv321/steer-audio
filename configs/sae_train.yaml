@@ -1,0 +1,18 @@
+# Root Hydra config for sae/sae_src/scripts/train_ace.py
+# Usage: python train_ace.py run_name=my_run hookpoints=[tf7]
+
+defaults:
+  - _self_
+  - experiment: sae_training
+
+# Required fields — must be provided at runtime.
+run_name: ???
+hookpoints: []
+dataset_path: []
+
+# SAE architecture (paper defaults from arXiv 2602.11910 Table 3).
+expansion_factor: 4
+k: 64
+
+seed: 42
+device: cuda

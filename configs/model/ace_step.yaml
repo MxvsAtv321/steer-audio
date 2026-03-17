@@ -1,0 +1,23 @@
+# ACE-Step model configuration.
+# ACE-Step is a DiT-based music-generation model with 24 cross-attention transformer layers.
+# Reference: arXiv 2602.11910 — Table 1.
+
+name: ace-step
+
+# Transformer hidden dimension (d_model).
+hidden_dim: 3072
+
+# Total number of cross-attention transformer layers.
+num_layers: 24
+
+# Layers where musical concepts are most strongly localised (found via activation patching).
+functional_layers: [6, 7]
+
+# Number of cross-attention heads.
+cross_attn_heads: 24
+
+# Native sample rate of generated audio (Hz).
+sample_rate: 44100
+
+# Maximum supported audio duration in seconds.
+max_duration: 240

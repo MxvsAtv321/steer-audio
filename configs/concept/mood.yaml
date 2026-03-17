@@ -1,0 +1,26 @@
+# Concept configuration: MOOD (valence)
+# Positive class = happy/joyful; negative class = sad/melancholic.
+
+name: mood
+
+positive_keywords:
+  - happy
+  - joyful
+  - cheerful
+  - upbeat
+
+negative_keywords:
+  - sad
+  - melancholic
+  - somber
+  - gloomy
+
+# Number of top SAE features (τ).
+tau: 20
+
+alpha_range:
+  start: -100
+  stop: 100
+  step: 10
+
+similarity_metric: clap

@@ -1,0 +1,9 @@
+# Minimal example prompt list for smoke-testing the patching pipeline.
+# Created by Prompt 1.2 — fixes pre-existing missing config reference.
+type: "list"
+prompts:
+  - "opera music"
+  - "rock music with piano"
+prompts_patch:
+  - "opera music"
+  - "rock music with piano"

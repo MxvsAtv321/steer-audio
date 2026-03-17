@@ -4,11 +4,15 @@ defaults:
   - _self_
   - patch_model: audioldm2_patch
   - patch_config: audioldm2
-  - patch_layers: audioldm2/no_layers
+  - patch_layers: audioldm2/none
   - patch_data: example_prompts
   - paths: default
   - extras: default
   - experiment: null
+  # Unified config groups added by Prompt 1.2 — null means "not selected by default".
+  # Override at runtime: model=ace_step concept=tempo experiment=patching
+  - model: null
+  - concept: null
 
 task_name: "generate_with_patch"
 

@@ -1,0 +1,22 @@
+# Stable Audio Open model configuration.
+# Reference: https://stability.ai/research/stable-audio-open
+
+name: stable-audio-open
+
+# Transformer hidden dimension.
+hidden_dim: 1536
+
+# Total number of transformer layers.
+num_layers: 24
+
+# Layers localised for musical concepts (to be confirmed via patching experiments).
+functional_layers: [6, 7]
+
+# Number of attention heads.
+num_heads: 24
+
+# Native sample rate of generated audio (Hz).
+sample_rate: 44100
+
+# Maximum supported audio duration in seconds.
+max_duration: 47

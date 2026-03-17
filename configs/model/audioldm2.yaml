@@ -1,0 +1,22 @@
+# AudioLDM2 model configuration.
+# Reference: https://huggingface.co/cvssp/audioldm2-music
+
+name: audioldm2
+
+# UNet hidden dimension.
+hidden_dim: 1024
+
+# Total number of transformer layers in the UNet middle block.
+num_layers: 16
+
+# Layers localised for musical concepts (to be confirmed via patching experiments).
+functional_layers: [6, 7]
+
+# Number of attention heads.
+num_heads: 16
+
+# Native sample rate of generated audio (Hz).
+sample_rate: 16000
+
+# Maximum supported audio duration in seconds.
+max_duration: 10

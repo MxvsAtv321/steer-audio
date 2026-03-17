@@ -1,0 +1,32 @@
+# Experiment configuration: SAE TRAINING
+# Used by sae/sae_src/scripts/train_ace.py.
+
+name: sae_training
+
+# SAE architecture — paper values (arXiv 2602.11910 Table 3).
+expansion_factor: 4   # m: dictionary size = expansion_factor * hidden_dim
+k: 64                 # TopK sparsity: exactly k features active per token
+
+# Training hyper-parameters.
+lr: 3.0e-5
+lr_scheduler: linear
+lr_warmup_steps: 1000
+num_epochs: 10
+batch_size: 2048
+
+# Auxiliary loss weight for preventing dead features.
+auxk_alpha: 0.03125
+
+# Weights & Biases logging.
+wandb_project: music_sae
+wandb_log_frequency: 250
+
+# Dataset settings.
+only_cond_preds: true   # Use only conditional (non-null-guidance) activations.
+sae_mode: sequence      # "sequence" or "frequency" reshape of activations.
+
+# Mixed precision.  "no" = fp32; "fp16" or "bf16" for faster training.
+mixed_precision: "no"
+
+# Output sub-directory relative to workdir.
+output_subdir: sae_training

@@ -1,0 +1,22 @@
+# Experiment configuration: ACTIVATION PATCHING
+# Used by src/patch_layers.py to localise concept-relevant layers.
+
+name: patching
+
+# Number of inference steps for audio generation during patching.
+num_inference_steps: 50
+
+# Number of distinct latent seeds used per concept (affects variance estimate).
+n_seeds: 8
+
+# Layers to sweep during the patching experiment.
+# Each entry is a Hydra-compatible layer identifier from configs/patch_layers/.
+layers_to_sweep:
+  - all
+  - tf6
+  - tf7
+  - tf6tf7
+  - no_tf6tf7
+
+# Output sub-directory relative to workdir.
+output_subdir: patching
