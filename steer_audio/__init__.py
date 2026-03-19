@@ -31,3 +31,4 @@ from steer_audio.concept_algebra import (  # noqa: F401
 )
 from steer_audio.self_monitor import ConceptProbe, SelfMonitoredSteerer  # noqa: F401
 from steer_audio.pipeline import SteeringPipeline  # noqa: F401
+from steer_audio.eval_metrics import EvalSuite, MetricResult, compute_alpha_sweep  # noqa: F401
