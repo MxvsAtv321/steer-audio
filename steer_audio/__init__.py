@@ -13,9 +13,13 @@ Provides:
 """
 
 from steer_audio.vector_bank import SteeringVector, SteeringVectorBank  # noqa: F401
+# CLI entry point (importable; invoked as `tada` via pyproject.toml scripts)
+from steer_audio import cli as cli  # noqa: F401
 from steer_audio.multi_steer import MultiConceptSteerer  # noqa: F401
 from steer_audio.temporal_steering import (  # noqa: F401
     TimestepAdaptiveSteerer,
+    LegacyTimestepAdaptiveSteerer,
+    get_schedule,
     TimestepSchedule,
     constant_schedule,
     cosine_schedule,
@@ -32,3 +36,4 @@ from steer_audio.concept_algebra import (  # noqa: F401
 from steer_audio.self_monitor import ConceptProbe, SelfMonitoredSteerer  # noqa: F401
 from steer_audio.pipeline import SteeringPipeline  # noqa: F401
 from steer_audio.eval_metrics import EvalSuite, MetricResult, compute_alpha_sweep  # noqa: F401
+from steer_audio.hub import upload_vectors, download_vectors  # noqa: F401

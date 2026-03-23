@@ -33,7 +33,7 @@ from steer_audio.temporal_steering import (
     cosine_schedule,
     constant_schedule,
     early_only_schedule,
-    TimestepAdaptiveSteerer,
+    LegacyTimestepAdaptiveSteerer as TimestepAdaptiveSteerer,
 )
 from steer_audio.concept_algebra import ConceptAlgebra, ConceptFeatureSet
 from steer_audio.self_monitor import ConceptProbe
@@ -693,3 +693,299 @@ class TestPipelineSteerValidation:
                 "test",
                 alphas={"tempo": 60.0, "ghost": 40.0},  # "ghost" is not registered
             )
+
+
+# ---------------------------------------------------------------------------
+# 9. Prompt 2.6 — new generate() / context-manager / chaining API
+# ---------------------------------------------------------------------------
+
+
+class MockAceStep(torch.nn.Module):
+    """Minimal ACE-Step mock compatible with SteeringPipeline's hook interface.
+
+    Has two linear layers at 'transformer blocks' 6 and 7 and a callable
+    ``pipeline`` attribute that performs a trivial forward pass.
+    """
+
+    sample_rate = 44100
+
+    def __init__(self, num_blocks: int = 10, dim: int = _DIM) -> None:
+        super().__init__()
+
+        class CrossAttn(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cross_attn = CrossAttn()
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.cross_attn(x)
+
+        self.transformer_blocks = torch.nn.ModuleList(
+            [Block() for _ in range(num_blocks)]
+        )
+
+    def __call__(self, **kwargs: Any) -> np.ndarray:
+        """Simulate pipeline inference: return a short silence array."""
+        return np.zeros(self.sample_rate, dtype=np.float32)
+
+    @property
+    def pipeline(self):
+        return self
+
+
+class TestPrompt26GenerateAPI:
+    """Prompt 2.6: generate(), context manager, chaining, interference report."""
+
+    # ------------------------------------------------------------------ #
+    # dry_run=True: validates config without running inference
+    # ------------------------------------------------------------------ #
+
+    def test_dry_run_returns_structured_dict(self):
+        """generate(dry_run=True) returns the expected dict keys."""
+        sv_tempo = _make_sv("tempo", seed=0)
+        sv_mood = _make_sv("mood", seed=1)
+        pipeline = (
+            SteeringPipeline({"tempo": sv_tempo, "mood": sv_mood}, orthogonalize=False)
+            .add_concept("tempo", alpha=60.0)
+            .add_concept("mood", alpha=40.0)
+        )
+        result = pipeline.generate("a jazz trio", dry_run=True)
+
+        assert result["dry_run"] is True
+        assert result["audio"] is None
+        assert result["sample_rate"] == 44100
+        assert result["prompt"] == "a jazz trio"
+        assert set(result["concepts"]) == {"tempo", "mood"}
+        assert result["alphas"]["tempo"] == 60.0
+        assert result["alphas"]["mood"] == 40.0
+
+    def test_dry_run_single_concept_no_interference(self):
+        """Single concept dry-run does not include interference key."""
+        sv = _make_sv("tempo", seed=0)
+        pipeline = SteeringPipeline({"tempo": sv}, orthogonalize=False)
+        pipeline.add_concept("tempo", alpha=50.0)
+        result = pipeline.generate("a fast beat", dry_run=True)
+        # Interference report is only added when > 1 concept is active.
+        assert "interference" not in result
+
+    def test_dry_run_multi_concept_includes_interference(self):
+        """Multi-concept dry-run includes an interference dict."""
+        svs = {c: _make_sv(c, seed=i) for i, c in enumerate(["jazz", "drums", "mood"])}
+        pipeline = SteeringPipeline(svs, orthogonalize=False)
+        for c in svs:
+            pipeline.add_concept(c, alpha=30.0)
+        result = pipeline.generate("a groovy track", dry_run=True)
+        assert "interference" in result
+        report = result["interference"]
+        assert "concepts" in report
+        assert "max_cosine" in report
+
+    def test_dry_run_no_model_required(self):
+        """generate(dry_run=True) works with model=None."""
+        sv = _make_sv("tempo", seed=0)
+        pipeline = SteeringPipeline({"tempo": sv}, orthogonalize=False)
+        pipeline.add_concept("tempo", alpha=80.0)
+        # Must not raise even though no model is attached.
+        result = pipeline.generate("test", dry_run=True)
+        assert result["audio"] is None
+
+    def test_non_dry_run_no_model_raises(self):
+        """generate(dry_run=False) with no model raises RuntimeError."""
+        sv = _make_sv("tempo", seed=0)
+        pipeline = SteeringPipeline({"tempo": sv}, orthogonalize=False)
+        pipeline.add_concept("tempo", alpha=40.0)
+        with pytest.raises(RuntimeError, match="requires a model"):
+            pipeline.generate("test", dry_run=False)
+
+    # ------------------------------------------------------------------ #
+    # Context manager: hooks registered and removed
+    # ------------------------------------------------------------------ #
+
+    def test_context_manager_cleans_up_hooks(self):
+        """Hooks registered during generate() are removed on __exit__."""
+        model = MockAceStep(num_blocks=10)
+        sv = _make_sv("tempo", layers=[6, 7], seed=0)
+
+        def _count_hooks(m: torch.nn.Module) -> int:
+            return sum(len(mod._forward_hooks) for mod in m.modules())
+
+        with SteeringPipeline(
+            {"tempo": sv},
+            model=model,
+            orthogonalize=False,
+            schedule_type="cosine",
+        ) as p:
+            p.add_concept("tempo", alpha=60.0)
+            # No hooks yet before generate().
+            assert _count_hooks(model) == 0
+            result = p.generate("a fast beat", seed=1, num_inference_steps=5)
+            assert result["dry_run"] is False
+            # After generate(), hooks must be cleaned up by the finally block.
+            assert _count_hooks(model) == 0
+
+        # After __exit__ as well.
+        assert _count_hooks(model) == 0
+
+    def test_context_manager_cleans_up_on_exception(self):
+        """__exit__ removes lingering handles even when inference raises."""
+
+        class _FailModel:
+            sample_rate = 44100
+            transformer_blocks: Any
+
+            def __init__(self):
+                self.transformer_blocks = torch.nn.ModuleList(
+                    [_make_mock_model(1).transformer_blocks[0]]
+                    * 10
+                )
+
+            def __call__(self, **kwargs):
+                raise RuntimeError("forced_failure")
+
+            @property
+            def pipeline(self):
+                return self
+
+        model = _FailModel()
+        sv = _make_sv("tempo", layers=[6, 7], seed=0)
+
+        with SteeringPipeline(
+            {"tempo": sv},
+            model=model,
+            orthogonalize=False,
+        ) as p:
+            p.add_concept("tempo", alpha=60.0)
+            with pytest.raises(RuntimeError, match="forced_failure"):
+                p.generate("test", num_inference_steps=5)
+            # Handles must be empty after the failed generate().
+            assert p._handles == []
+
+    # ------------------------------------------------------------------ #
+    # Fluent chaining API
+    # ------------------------------------------------------------------ #
+
+    def test_add_concept_returns_self(self):
+        """add_concept() returns the pipeline for chaining."""
+        sv = _make_sv("tempo", seed=0)
+        pipeline = SteeringPipeline({"tempo": sv}, orthogonalize=False)
+        ret = pipeline.add_concept("tempo", alpha=60.0)
+        assert ret is pipeline
+
+    def test_remove_concept_returns_self(self):
+        """remove_concept() returns the pipeline for chaining."""
+        sv = _make_sv("tempo", seed=0)
+        pipeline = SteeringPipeline({"tempo": sv}, orthogonalize=False)
+        pipeline.add_concept("tempo", alpha=60.0)
+        ret = pipeline.remove_concept("tempo")
+        assert ret is pipeline
+
+    def test_chaining_multiple_concepts_with_schedule(self):
+        """Fluent chain with multiple concepts and a non-constant schedule."""
+        sv_tempo = _make_sv("tempo", seed=0)
+        sv_mood = _make_sv("mood", seed=1)
+        pipeline = (
+            SteeringPipeline(
+                {"tempo": sv_tempo, "mood": sv_mood},
+                orthogonalize=False,
+                schedule_type="cosine",
+            )
+            .add_concept("tempo", alpha=60.0)
+            .add_concept("mood", alpha=40.0)
+            .set_schedule("linear")
+        )
+        assert pipeline._schedule_type == "linear"
+        assert set(pipeline._alphas.keys()) >= {"tempo", "mood"}
+        result = pipeline.generate("a mellow groove", dry_run=True)
+        assert set(result["concepts"]) == {"tempo", "mood"}
+
+    def test_remove_concept_excludes_from_generate(self):
+        """After remove_concept, that concept is absent from generate() output."""
+        sv_tempo = _make_sv("tempo", seed=0)
+        sv_mood = _make_sv("mood", seed=1)
+        pipeline = (
+            SteeringPipeline({"tempo": sv_tempo, "mood": sv_mood}, orthogonalize=False)
+            .add_concept("tempo", alpha=60.0)
+            .add_concept("mood", alpha=40.0)
+            .remove_concept("mood")
+        )
+        result = pipeline.generate("test", dry_run=True)
+        assert "mood" not in result["concepts"]
+        assert "tempo" in result["concepts"]
+
+    # ------------------------------------------------------------------ #
+    # get_interference_report()
+    # ------------------------------------------------------------------ #
+
+    def test_interference_report_keys(self):
+        """get_interference_report() returns expected keys."""
+        sv_jazz = _make_sv("jazz", seed=10)
+        sv_techno = _make_sv("techno", seed=11)
+        pipeline = (
+            SteeringPipeline({"jazz": sv_jazz, "techno": sv_techno}, orthogonalize=False)
+            .add_concept("jazz", alpha=40.0)
+            .add_concept("techno", alpha=40.0)
+        )
+        report = pipeline.get_interference_report()
+        assert "concepts" in report
+        assert "cosine_matrix" in report
+        assert "max_cosine" in report
+        assert "warnings" in report
+        assert "clap_deltas" in report
+
+    def test_interference_report_shape(self):
+        """cosine_matrix is N×N where N = number of active concepts."""
+        svs = {c: _make_sv(c, seed=i) for i, c in enumerate(["a", "b", "c"])}
+        pipeline = SteeringPipeline(svs, orthogonalize=False)
+        for c in svs:
+            pipeline.add_concept(c, alpha=10.0)
+        report = pipeline.get_interference_report()
+        n = len(svs)
+        assert report["cosine_matrix"].shape == (n, n), (
+            f"Expected ({n},{n}), got {report['cosine_matrix'].shape}"
+        )
+
+    def test_interference_report_diagonal_ones(self):
+        """Diagonal of cosine_matrix is all 1.0 (self-similarity)."""
+        sv_a = _make_sv("a", seed=20)
+        sv_b = _make_sv("b", seed=21)
+        pipeline = (
+            SteeringPipeline({"a": sv_a, "b": sv_b}, orthogonalize=False)
+            .add_concept("a", alpha=1.0)
+            .add_concept("b", alpha=1.0)
+        )
+        mat = pipeline.get_interference_report()["cosine_matrix"]
+        diag = mat.diagonal()
+        np.testing.assert_allclose(diag, np.ones_like(diag), atol=1e-5)
+
+    # ------------------------------------------------------------------ #
+    # SteeringPipeline from SteeringVectorBank (bank-first constructor)
+    # ------------------------------------------------------------------ #
+
+    def test_bank_constructor_no_initial_vectors(self):
+        """SteeringPipeline(bank) starts with no concepts; add_concept fills it."""
+        bank = SteeringVectorBank()
+        sv = _make_sv("tempo", seed=0)
+        bank._registry["tempo_caa"] = sv
+
+        pipeline = SteeringPipeline(bank, orthogonalize=False)
+        pipeline.add_concept("tempo", alpha=60.0, method="caa")
+        # Should find the vector from the bank.
+        assert "tempo" in pipeline._vectors or "tempo_caa" in pipeline._vectors
+
+    def test_dry_run_summary_output(self):
+        """generate(dry_run=True) result contains expected summary fields."""
+        sv = _make_sv("tempo", seed=0)
+        pipeline = SteeringPipeline({"tempo": sv}, orthogonalize=False)
+        pipeline.add_concept("tempo", alpha=70.0)
+        result = pipeline.generate("a fast track", dry_run=True)
+        # Summary via __repr__
+        r = repr(pipeline)
+        assert "SteeringPipeline" in r
+        assert "tempo" in r
+        # Result dict completeness
+        for key in ("audio", "sample_rate", "prompt", "seed", "concepts", "alphas", "dry_run"):
+            assert key in result, f"Missing key: {key}"

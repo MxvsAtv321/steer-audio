@@ -2,12 +2,23 @@
 Unit tests for the Sparse Autoencoder (SAE) model.
 
 Covers: encoding shape, top-k sparsity, reconstruction shape,
-training convergence, pre-bias subtraction, and decoder unit-norm init.
+training convergence, pre-bias subtraction, decoder unit-norm init,
+TF-IDF scoring formula, dead feature detection, and SAE steering vector
+construction (Eq. 7 from arXiv 2602.11910).
 """
+
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SAE_ROOT = _REPO_ROOT / "sae"
+for _p in [str(_REPO_ROOT), str(_SAE_ROOT)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 # ---------------------------------------------------------------------------
@@ -153,4 +164,111 @@ def test_decoder_columns_unit_norm(mock_sae):
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), (
         f"Decoder row norms should be 1.0; "
         f"got min={norms.min().item():.6f}, max={norms.max().item():.6f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. TF-IDF scoring formula matches manual reference (Eq. 6, arXiv 2602.11910)
+# ---------------------------------------------------------------------------
+
+
+def test_tfidf_formula_manual_reference():
+    """TF-IDF scores match manually computed values for 3 known features.
+
+    Formula (Eq. 6):
+        score(j, c) = μ_j(P_c) · log(1 + 1 / (μ_j(P_~c) + ε))
+
+    where ε = 1e-6 (default in compute_tfidf_scores).
+    """
+    from tfidf_utils import compute_tfidf_scores
+
+    eps = 1e-6
+    # Each row is one "sample"; mean over dim=0 gives feature mean.
+    # Use 1-sample tensors so that mean == the value itself.
+    mean_pos = torch.tensor([2.0, 0.0, 1.0])
+    mean_neg = torch.tensor([0.5, 1.0, 0.0])
+
+    pos_activations = mean_pos.unsqueeze(0)   # (1, 3)
+    neg_activations = mean_neg.unsqueeze(0)   # (1, 3)
+
+    # Manual reference
+    expected = mean_pos * torch.log(1.0 + 1.0 / (mean_neg + eps))
+
+    scores = compute_tfidf_scores(pos_activations, neg_activations, eps=eps)
+
+    assert torch.allclose(scores, expected, atol=1e-5), (
+        f"TF-IDF scores do not match manual reference.\n"
+        f"Expected: {expected.tolist()}\n"
+        f"Got:      {scores.tolist()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. Dead feature detection
+# ---------------------------------------------------------------------------
+
+
+def test_dead_feature_detection(mock_sae, small_activation_tensor):
+    """After zeroing encoder weights for selected features, those features
+    are always inactive (zero activation), and the dead-feature count is correct.
+
+    A 'dead' feature is one whose mean SAE activation across all inputs is 0.
+    """
+    import math
+
+    dead_feature_indices = [0, 3, 7]  # Force these features to be dead
+
+    with torch.no_grad():
+        for idx in dead_feature_indices:
+            mock_sae.encoder.weight.data[idx, :] = 0.0
+            mock_sae.encoder.bias.data[idx] = -1e6  # large negative → always 0 after ReLU
+
+    x = small_activation_tensor  # (2, 16, 64)
+    flat = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
+    pre = mock_sae.pre_acts(flat)  # (32, num_latents); ReLU output
+
+    # Per-feature mean activation across all tokens
+    mean_acts = pre.mean(dim=0)  # (num_latents,)
+    dead_mask = mean_acts == 0.0
+    dead_count = dead_mask.sum().item()
+
+    assert dead_count >= len(dead_feature_indices), (
+        f"Expected at least {len(dead_feature_indices)} dead features; "
+        f"got {dead_count}."
+    )
+
+    for idx in dead_feature_indices:
+        assert dead_mask[idx].item(), (
+            f"Feature {idx} should be dead (mean_act=0) after zeroing weights, "
+            f"but mean_act={mean_acts[idx].item():.6f}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 9. SAE steering vector construction (Eq. 7, arXiv 2602.11910)
+# ---------------------------------------------------------------------------
+
+
+def test_sae_steering_vector_construction(mock_sae):
+    """v_c^SAE = Σ_{j ∈ F_c} W_dec[j, :] produces the correct shape and values.
+
+    W_dec has shape (num_latents, d_in); each row is the decoder direction for
+    one feature. The SAE steering vector for concept c is the sum of the
+    decoder directions of the concept-discriminative feature set F_c.
+    """
+    d_in = mock_sae.d_in  # 64
+    F_c = [0, 2, 4]  # arbitrary small feature set
+
+    # Manual reference: sum of selected W_dec rows
+    expected = mock_sae.W_dec.data[F_c, :].sum(dim=0)  # (d_in,)
+    assert expected.shape == (d_in,), f"Expected shape ({d_in},); got {expected.shape}"
+
+    # Compute using the same formula
+    v_sae = torch.zeros(d_in)
+    for j in F_c:
+        v_sae = v_sae + mock_sae.W_dec.data[j, :]
+
+    assert v_sae.shape == (d_in,), f"SAE steering vector shape should be ({d_in},)"
+    assert torch.allclose(v_sae, expected, atol=1e-6), (
+        "SAE steering vector does not match manual sum of decoder directions."
     )

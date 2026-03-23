@@ -1,8 +1,15 @@
+# ============================================================
 # Concept configuration: VOCAL GENDER
 # Positive class = female vocals; negative class = male vocals.
+# ============================================================
 
 name: vocal_gender
 
+# Primary positive / negative keywords for prompt generation and CAA.
+positive_keyword: "female vocals"
+negative_keyword: "male vocals"
+
+# Extended keyword lists for richer prompt variation.
 positive_keywords:
   - female vocals
   - woman singing
@@ -13,13 +20,11 @@ negative_keywords:
   - man singing
   - baritone
 
-# Number of top SAE features (τ).
+# Number of top SAE features selected per concept via TF-IDF scoring.
 tau: 20
 
-alpha_range:
-  start: -100
-  stop: 100
-  step: 10
+# Alpha values swept during evaluation (arXiv 2602.11910 §5).
+alpha_range: [-100, -90, -80, -70, -60, -50, -40, -30, -20, -10, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
-# MUQ-T better captures perceptual vocal gender difference than CLAP.
-similarity_metric: muq
+# CLAP text-audio similarity captures vocal gender well.
+similarity_metric: clap

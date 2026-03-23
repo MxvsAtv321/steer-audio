@@ -6,8 +6,10 @@ from simple_parsing import Serializable, list_field
 
 @dataclass
 class SaeConfig(Serializable):
-    """
-    Configuration for training a sparse autoencoder on a language model.
+    """Configuration for training a Sparse Autoencoder (SAE) on audio model activations.
+
+    Default hyper-parameters match the TADA paper (arXiv 2602.11910, Table 3):
+    expansion factor m=4 (Eq. 3) and TopK sparsity k=64 (Eq. 4).
     """
 
     expansion_factor: int = 4
@@ -112,11 +114,11 @@ class TrainConfig(Serializable):
 
 @dataclass
 class CacheActivationsRunnerConfig:
-    """
-    Configuration for caching model activations used in SAE training.
+    """Configuration for caching ACE-Step activations used in SAE training.
 
-    This config is for ACE-Step only. For AudioLDM2 or Stable Audio, use
-    the corresponding runner configs in their respective scripts.
+    Defaults are tuned for ACE-Step (arXiv 2602.11910 §4.2):
+    guidance_scale=7.0 matches the audio generation setup described in the paper.
+    For AudioLDM2 or Stable Audio, use the corresponding runner configs.
     All paths are relative to the working directory unless absolute.
     """
 
@@ -140,8 +142,8 @@ class CacheActivationsRunnerConfig:
     num_workers: int = 8
     max_num_examples: int | None = None
     cache_every_n_timesteps: int = 1
-    # BUG FIX: guidance_scale changed from 9.0 to 7.5 (standard audio diffusion default) — 2026-03-17
-    guidance_scale: float = 7.5
+    # BUG FIX: guidance_scale changed from 9.0 to 7.0 (TADA paper default, arXiv 2602.11910) — 2026-03-17
+    guidance_scale: float = 7.0
     audio_length_in_s: float | None = None
     num_waveforms_per_prompt: int | None = None
     hf_repo_id: str | None = None

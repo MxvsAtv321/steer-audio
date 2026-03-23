@@ -1,453 +1,495 @@
 """
-Tests for steer_audio.temporal_steering — Phase 2, Prompt 2.2.
+Tests for steer_audio.temporal_steering — Prompt 2.3: Timestep-Adaptive Steering.
 
 Covers:
-- All four built-in schedule functions
-- Linear schedule (bonus)
-- TimestepAdaptiveSteerer (hook registration, per-step alpha dispatch,
-  hook cleanup, CAA vs. SAE path)
-- Schedule symmetry and boundary conditions
+- get_schedule: all 5 types at step=0, mid, final for total_steps=60
+- early_only / late_only boundaries
+- step_alpha scaling examples
+- advance_step / reset behavior
+- Clamping when step >= total_steps
+- register_scheduled_hooks: hook registration, scale interacts with step state
+- Invalid schedule_type raises ValueError
+All tests are CPU-only and independent of ACE-Step / real audio.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
-from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
-from steer_audio.temporal_steering import (
-    TimestepAdaptiveSteerer,
-    TimestepSchedule,
-    constant_schedule,
-    cosine_schedule,
-    early_only_schedule,
-    late_only_schedule,
-    linear_schedule,
-)
-from steer_audio.vector_bank import SteeringVector
+from steer_audio.multi_steer import MultiConceptSteerer
+from steer_audio.temporal_steering import TimestepAdaptiveSteerer, get_schedule
+from steer_audio.vector_bank import SteeringVector, SteeringVectorBank
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Helpers / fixtures
 # ---------------------------------------------------------------------------
 
+TOTAL = 60  # canonical ACE-Step step count
 
-@pytest.fixture
-def caa_vector() -> SteeringVector:
-    """Minimal CAA SteeringVector for layers [0, 1], hidden_dim=64."""
-    torch.manual_seed(0)
-    return SteeringVector(
+
+def _make_bank(dim: int = 8, alpha: float = 50.0) -> tuple[SteeringVectorBank, MultiConceptSteerer]:
+    """Return a (bank, steerer) pair with one active concept."""
+    torch.manual_seed(42)
+    sv = SteeringVector(
         concept="tempo",
         method="caa",
         model_name="ace-step",
         layers=[0, 1],
-        vector=torch.randn(64),
-        clap_delta=0.15,
+        vector=torch.randn(dim),
     )
+    bank = SteeringVectorBank()
+    bank.add(sv)
+    multi = MultiConceptSteerer(bank)
+    multi.add_concept("tempo", alpha=alpha)
+    return bank, multi
 
 
-@pytest.fixture
-def sae_vector() -> SteeringVector:
-    """Minimal SAE SteeringVector for layer [0], hidden_dim=64."""
-    torch.manual_seed(1)
-    return SteeringVector(
-        concept="mood",
-        method="sae",
-        model_name="ace-step",
-        layers=[0],
-        vector=torch.randn(64),
-        clap_delta=0.10,
-    )
+class _SimpleModel(nn.Module):
+    """2-layer model whose children can be hooked."""
 
-
-class _SimpleBlock(nn.Module):
-    """Minimal transformer block stub with a cross_attn sub-module."""
-
-    def __init__(self, dim: int = 64) -> None:
+    def __init__(self, dim: int = 8) -> None:
         super().__init__()
-        self.cross_attn = nn.Identity()
+        self.layer0 = nn.Linear(dim, dim, bias=False)
+        self.layer1 = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.cross_attn(x)
-
-
-def _make_model(n_blocks: int = 4, dim: int = 64) -> Any:
-    """Return a stub model whose transformer_blocks are _SimpleBlocks."""
-    model = MagicMock()
-    blocks = nn.ModuleList([_SimpleBlock(dim) for _ in range(n_blocks)])
-    model.transformer_blocks = blocks
-    # pipeline mock: returns a zero audio tensor.
-    pipeline_mock = MagicMock()
-    pipeline_mock.return_value = torch.zeros(dim)
-    pipeline_mock.sample_rate = 44100
-    model.pipeline = pipeline_mock
-    return model
+        return self.layer1(self.layer0(x))
 
 
 # ---------------------------------------------------------------------------
-# constant_schedule
+# get_schedule — constant
 # ---------------------------------------------------------------------------
 
 
-class TestConstantSchedule:
-    def test_returns_alpha_at_every_timestep(self) -> None:
-        sched = constant_schedule(60.0)
-        for t in [0, 1, 15, 29, 30]:
-            assert sched(t, 30) == pytest.approx(60.0)
+class TestGetScheduleConstant:
+    def test_step0(self) -> None:
+        f = get_schedule("constant")
+        assert f(0, TOTAL) == pytest.approx(1.0)
 
-    def test_zero_alpha(self) -> None:
-        sched = constant_schedule(0.0)
-        assert sched(10, 30) == pytest.approx(0.0)
+    def test_mid(self) -> None:
+        f = get_schedule("constant")
+        assert f(30, TOTAL) == pytest.approx(1.0)
 
-    def test_negative_alpha(self) -> None:
-        sched = constant_schedule(-50.0)
-        assert sched(5, 30) == pytest.approx(-50.0)
+    def test_final(self) -> None:
+        f = get_schedule("constant")
+        assert f(TOTAL, TOTAL) == pytest.approx(1.0)
 
-
-# ---------------------------------------------------------------------------
-# cosine_schedule
-# ---------------------------------------------------------------------------
-
-
-class TestCosineSchedule:
-    def test_peak_at_start(self) -> None:
-        """t = T → t/T = 1 → alpha = alpha_max."""
-        sched = cosine_schedule(80.0)
-        assert sched(30, 30) == pytest.approx(80.0, abs=1e-6)
-
-    def test_trough_at_end(self) -> None:
-        """t = 0 → alpha = alpha_min = 0.0."""
-        sched = cosine_schedule(80.0)
-        assert sched(0, 30) == pytest.approx(0.0, abs=1e-6)
-
-    def test_alpha_min_offset(self) -> None:
-        """alpha_min shifts the trough."""
-        sched = cosine_schedule(80.0, alpha_min=20.0)
-        assert sched(0, 30) == pytest.approx(20.0, abs=1e-6)
-        assert sched(30, 30) == pytest.approx(80.0, abs=1e-6)
-
-    def test_midpoint_is_halfway(self) -> None:
-        """t = T/2 → factor ≈ 0.5 → alpha ≈ (alpha_max + alpha_min) / 2."""
-        sched = cosine_schedule(80.0, alpha_min=0.0)
-        mid = sched(15, 30)
-        expected = 0.5 * (1.0 + math.cos(math.pi * (1.0 - 15 / 30))) * 80.0
-        assert mid == pytest.approx(expected, abs=1e-5)
-
-    def test_monotonically_decreasing(self) -> None:
-        """Alpha should be non-increasing as t decreases from T to 0."""
-        sched = cosine_schedule(80.0)
-        T = 30
-        values = [sched(t, T) for t in range(T, -1, -1)]  # T down to 0
-        for i in range(len(values) - 1):
-            assert values[i] >= values[i + 1] - 1e-9
-
-    def test_zero_total_steps_safe(self) -> None:
-        """T = 0 must not raise ZeroDivisionError."""
-        sched = cosine_schedule(80.0)
-        result = sched(0, 0)
-        assert math.isfinite(result)
+    def test_beyond_total(self) -> None:
+        f = get_schedule("constant")
+        assert f(TOTAL + 10, TOTAL) == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
-# early_only_schedule
+# get_schedule — linear
 # ---------------------------------------------------------------------------
 
 
-class TestEarlyOnlySchedule:
-    def test_active_above_cutoff(self) -> None:
-        sched = early_only_schedule(60.0, cutoff=0.5)
-        assert sched(20, 30) == pytest.approx(60.0)  # t/T ≈ 0.67 > 0.5
+class TestGetScheduleLinear:
+    def test_step0_is_one(self) -> None:
+        f = get_schedule("linear")
+        assert f(0, TOTAL) == pytest.approx(1.0)
 
-    def test_inactive_at_or_below_cutoff(self) -> None:
-        sched = early_only_schedule(60.0, cutoff=0.5)
-        assert sched(15, 30) == pytest.approx(0.0)   # t/T = 0.5, not > 0.5
-        assert sched(5, 30) == pytest.approx(0.0)    # t/T ≈ 0.17 ≤ 0.5
+    def test_mid_is_half(self) -> None:
+        f = get_schedule("linear")
+        assert f(30, TOTAL) == pytest.approx(0.5)
 
-    def test_full_range_active_at_cutoff_0(self) -> None:
-        """With cutoff=0 every step is 'early' (t/T > 0 for t >= 1)."""
-        sched = early_only_schedule(60.0, cutoff=0.0)
-        assert sched(1, 30) == pytest.approx(60.0)
+    def test_final_is_zero(self) -> None:
+        f = get_schedule("linear")
+        assert f(TOTAL, TOTAL) == pytest.approx(0.0)
 
-    def test_none_active_at_cutoff_1(self) -> None:
-        """With cutoff=1 no step satisfies t/T > 1."""
-        sched = early_only_schedule(60.0, cutoff=1.0)
-        assert sched(30, 30) == pytest.approx(0.0)  # t/T = 1, not > 1
+    def test_clamped_beyond_total(self) -> None:
+        """step > total_steps should clamp to 0.0."""
+        f = get_schedule("linear")
+        assert f(TOTAL + 5, TOTAL) == pytest.approx(0.0)
 
-
-# ---------------------------------------------------------------------------
-# late_only_schedule
-# ---------------------------------------------------------------------------
-
-
-class TestLateOnlySchedule:
-    def test_active_at_or_below_cutoff(self) -> None:
-        sched = late_only_schedule(60.0, cutoff=0.5)
-        assert sched(10, 30) == pytest.approx(60.0)  # t/T ≈ 0.33 ≤ 0.5
-        assert sched(15, 30) == pytest.approx(60.0)  # t/T = 0.5 ≤ 0.5
-
-    def test_inactive_above_cutoff(self) -> None:
-        sched = late_only_schedule(60.0, cutoff=0.5)
-        assert sched(20, 30) == pytest.approx(0.0)   # t/T ≈ 0.67 > 0.5
-
-    def test_complementary_to_early_only(self) -> None:
-        """early_only + late_only should equal constant at every step."""
-        alpha = 60.0
-        early = early_only_schedule(alpha, cutoff=0.5)
-        late = late_only_schedule(alpha, cutoff=0.5)
-        T = 30
-        for t in range(1, T + 1):
-            # They are NOT strictly complementary due to the strict inequality in early.
-            combined = early(t, T) + late(t, T)
-            # At the boundary t/T == 0.5 only late is active.
-            assert combined == pytest.approx(alpha)
+    def test_values_in_unit_interval(self) -> None:
+        f = get_schedule("linear")
+        for step in range(TOTAL + 1):
+            v = f(step, TOTAL)
+            assert 0.0 <= v <= 1.0 + 1e-9
 
 
 # ---------------------------------------------------------------------------
-# linear_schedule
+# get_schedule — cosine
 # ---------------------------------------------------------------------------
 
 
-class TestLinearSchedule:
-    def test_peak_at_start(self) -> None:
-        sched = linear_schedule(60.0)
-        assert sched(30, 30) == pytest.approx(60.0, abs=1e-6)
+class TestGetScheduleCosine:
+    def test_step0_is_one(self) -> None:
+        """(1 + cos(0)) / 2 = 1.0."""
+        f = get_schedule("cosine")
+        assert f(0, TOTAL) == pytest.approx(1.0)
 
-    def test_trough_at_end(self) -> None:
-        sched = linear_schedule(60.0)
-        assert sched(0, 30) == pytest.approx(0.0, abs=1e-6)
+    def test_mid_is_half(self) -> None:
+        """(1 + cos(π/2)) / 2 = 0.5."""
+        f = get_schedule("cosine")
+        assert f(30, TOTAL) == pytest.approx(0.5, abs=1e-6)
 
-    def test_linear_midpoint(self) -> None:
-        sched = linear_schedule(60.0, alpha_end=0.0)
-        assert sched(15, 30) == pytest.approx(30.0, abs=1e-6)
+    def test_final_is_zero(self) -> None:
+        """(1 + cos(π)) / 2 = 0.0."""
+        f = get_schedule("cosine")
+        assert f(TOTAL, TOTAL) == pytest.approx(0.0, abs=1e-6)
 
+    def test_formula(self) -> None:
+        """Verify exact formula at an arbitrary step."""
+        f = get_schedule("cosine")
+        step, total = 15, 60
+        expected = (1.0 + math.cos(math.pi * step / total)) / 2.0
+        assert f(step, total) == pytest.approx(expected, abs=1e-8)
 
-# ---------------------------------------------------------------------------
-# TimestepSchedule protocol conformance
-# ---------------------------------------------------------------------------
+    def test_clamped_beyond_total(self) -> None:
+        f = get_schedule("cosine")
+        assert f(TOTAL + 10, TOTAL) == pytest.approx(0.0, abs=1e-6)
 
-
-class TestTimestepScheduleProtocol:
-    def test_all_schedules_conform_to_protocol(self) -> None:
-        schedules = [
-            constant_schedule(50.0),
-            cosine_schedule(50.0),
-            early_only_schedule(50.0),
-            late_only_schedule(50.0),
-            linear_schedule(50.0),
-        ]
-        for sched in schedules:
-            assert isinstance(sched, TimestepSchedule), (
-                f"{sched} does not implement TimestepSchedule protocol"
-            )
-            result = sched(15, 30)
-            assert isinstance(result, float)
-
-
-# ---------------------------------------------------------------------------
-# TimestepAdaptiveSteerer
-# ---------------------------------------------------------------------------
-
-
-class TestTimestepAdaptiveSteerer:
-    def test_init_defaults_to_vector_layers(self, caa_vector: SteeringVector) -> None:
-        steerer = TimestepAdaptiveSteerer(caa_vector, constant_schedule(60.0))
-        assert steerer.layers == caa_vector.layers
-
-    def test_init_custom_layers(self, caa_vector: SteeringVector) -> None:
-        steerer = TimestepAdaptiveSteerer(caa_vector, constant_schedule(60.0), layers=[2])
-        assert steerer.layers == [2]
-
-    def test_schedule_values_length(self, caa_vector: SteeringVector) -> None:
-        steerer = TimestepAdaptiveSteerer(caa_vector, constant_schedule(60.0))
-        vals = steerer.schedule_values(30)
-        assert len(vals) == 30
-
-    def test_schedule_values_constant(self, caa_vector: SteeringVector) -> None:
-        steerer = TimestepAdaptiveSteerer(caa_vector, constant_schedule(60.0))
-        vals = steerer.schedule_values(30)
-        assert all(v == pytest.approx(60.0) for v in vals)
-
-    def test_schedule_values_cosine_decreasing(self, caa_vector: SteeringVector) -> None:
-        steerer = TimestepAdaptiveSteerer(caa_vector, cosine_schedule(80.0))
-        vals = steerer.schedule_values(30)
+    def test_monotonically_non_increasing(self) -> None:
+        f = get_schedule("cosine")
+        vals = [f(s, TOTAL) for s in range(TOTAL + 1)]
         for i in range(len(vals) - 1):
             assert vals[i] >= vals[i + 1] - 1e-9
 
-    def test_hooks_registered_and_removed(self, caa_vector: SteeringVector) -> None:
-        """Hook count on the target module is 0 after the context manager exits."""
-        steerer = TimestepAdaptiveSteerer(
-            caa_vector, constant_schedule(60.0), layers=[0]
-        )
-        model = _make_model(n_blocks=4, dim=64)
-        target = model.transformer_blocks[0].cross_attn
-
-        with steerer._hooked(model.transformer_blocks, total_T=30):
-            assert len(target._forward_hooks) == 1
-
-        assert len(target._forward_hooks) == 0
-
-    def test_hooks_registered_for_multiple_layers(
-        self, caa_vector: SteeringVector
-    ) -> None:
-        steerer = TimestepAdaptiveSteerer(
-            caa_vector, constant_schedule(60.0), layers=[0, 1]
-        )
-        model = _make_model(n_blocks=4, dim=64)
-        t0 = model.transformer_blocks[0].cross_attn
-        t1 = model.transformer_blocks[1].cross_attn
-
-        with steerer._hooked(model.transformer_blocks, total_T=30):
-            assert len(t0._forward_hooks) == 1
-            assert len(t1._forward_hooks) == 1
-
-        assert len(t0._forward_hooks) == 0
-        assert len(t1._forward_hooks) == 0
-
-    def test_out_of_range_layer_skipped(self, caa_vector: SteeringVector) -> None:
-        """Out-of-range layer index should be skipped without error."""
-        steerer = TimestepAdaptiveSteerer(
-            caa_vector, constant_schedule(60.0), layers=[99]
-        )
-        model = _make_model(n_blocks=4, dim=64)
-        # Should not raise.
-        with steerer._hooked(model.transformer_blocks, total_T=30):
-            pass
-
-    def test_caa_hook_modifies_activation(self, caa_vector: SteeringVector) -> None:
-        """A non-zero CAA hook must change the activation tensor."""
-        steerer = TimestepAdaptiveSteerer(
-            caa_vector, constant_schedule(60.0), layers=[0]
-        )
-        model = _make_model(n_blocks=4, dim=64)
-        x = torch.ones(1, 8, 64)  # (batch, seq, dim)
-        x_orig = x.clone()
-
-        # Manually trigger one forward pass through the hooked block.
-        with steerer._hooked(model.transformer_blocks, total_T=30):
-            out = model.transformer_blocks[0](x)
-
-        assert not torch.allclose(out, x_orig), (
-            "CAA hook at α=60 must change the activation"
-        )
-
-    def test_zero_alpha_hook_leaves_activation_unchanged(
-        self, caa_vector: SteeringVector
-    ) -> None:
-        """A zero-alpha hook must leave activation identical."""
-        steerer = TimestepAdaptiveSteerer(
-            caa_vector, constant_schedule(0.0), layers=[0]
-        )
-        model = _make_model(n_blocks=4, dim=64)
-        x = torch.ones(1, 8, 64)
-        x_orig = x.clone()
-
-        with steerer._hooked(model.transformer_blocks, total_T=30):
-            out = model.transformer_blocks[0](x)
-
-        assert torch.allclose(out, x_orig), (
-            "Zero-alpha hook must not change the activation"
-        )
-
-    def test_sae_hook_modifies_activation_without_renorm(
-        self, sae_vector: SteeringVector
-    ) -> None:
-        """SAE hook applies additive delta without renorm; output must differ."""
-        steerer = TimestepAdaptiveSteerer(
-            sae_vector, constant_schedule(60.0), layers=[0]
-        )
-        model = _make_model(n_blocks=4, dim=64)
-        x = torch.ones(1, 8, 64)
-        x_orig = x.clone()
-
-        with steerer._hooked(model.transformer_blocks, total_T=30):
-            out = model.transformer_blocks[0](x)
-
-        assert not torch.allclose(out, x_orig)
-
-    def test_early_only_hook_inactive_at_late_steps(
-        self, caa_vector: SteeringVector
-    ) -> None:
-        """With early_only_schedule, the last-step hook must not modify activations."""
-        T = 10
-        # Late step: t = max(1, T - (T-1)) = 1; t/T = 0.1 ≤ 0.5 → inactive.
-        steerer = TimestepAdaptiveSteerer(
-            caa_vector, early_only_schedule(80.0, cutoff=0.5), layers=[0]
-        )
-        model = _make_model(n_blocks=4, dim=64)
-        target = model.transformer_blocks[0].cross_attn
-        x = torch.ones(1, 8, 64)
-
-        outputs = []
-        with steerer._hooked(model.transformer_blocks, total_T=T):
-            # Simulate T forward passes; capture each output.
-            for _ in range(T):
-                outputs.append(target(x))
-
-        # Last output (step T-1 → t=1 → t/T=0.1 ≤ 0.5) should be unchanged.
-        x_orig = x  # Identity cross_attn returns x unchanged by design.
-        assert torch.allclose(outputs[-1], x_orig), (
-            "early_only hook must be inactive at the last diffusion step"
-        )
-
-    def test_steerer_get_transformer_blocks_fallback(
-        self, caa_vector: SteeringVector
-    ) -> None:
-        """_get_transformer_blocks should find blocks at model.transformer_blocks."""
-        steerer = TimestepAdaptiveSteerer(caa_vector, constant_schedule(60.0))
-
-        # Use a plain object so MagicMock does not auto-create patchable_model.
-        class _StubModel:
-            def __init__(self, b: nn.ModuleList) -> None:
-                self.transformer_blocks = b
-
-        blocks_list = nn.ModuleList([_SimpleBlock() for _ in range(4)])
-        stub = _StubModel(blocks_list)
-        found = steerer._get_transformer_blocks(stub)
-        assert len(found) == 4
-
-    def test_steerer_get_transformer_blocks_not_found(
-        self, caa_vector: SteeringVector
-    ) -> None:
-        """Should raise AttributeError if no recognized path exists."""
-        steerer = TimestepAdaptiveSteerer(caa_vector, constant_schedule(60.0))
-        bad_model = MagicMock(spec=[])  # no attributes at all
-        with pytest.raises(AttributeError):
-            steerer._get_transformer_blocks(bad_model)
-
 
 # ---------------------------------------------------------------------------
-# Schedule interaction tests
+# get_schedule — early_only
 # ---------------------------------------------------------------------------
 
 
-class TestScheduleInteractions:
-    def test_cosine_mean_less_than_constant(self) -> None:
-        """The mean alpha of cosine_schedule is less than constant_schedule."""
-        T = 30
-        alpha = 80.0
-        const = constant_schedule(alpha)
-        cosine = cosine_schedule(alpha)
-        mean_const = np.mean([const(max(1, T - k), T) for k in range(T)])
-        mean_cosine = np.mean([cosine(max(1, T - k), T) for k in range(T)])
-        assert mean_cosine < mean_const, (
-            "cosine schedule mean should be less than constant at same peak alpha"
+class TestGetScheduleEarlyOnly:
+    # Boundary: TOTAL * 0.4 = 24.  Active when step < 24.
+
+    def test_step0_active(self) -> None:
+        f = get_schedule("early_only")
+        assert f(0, TOTAL) == pytest.approx(1.0)
+
+    def test_step_just_before_boundary_active(self) -> None:
+        f = get_schedule("early_only")
+        assert f(23, TOTAL) == pytest.approx(1.0)  # 23 < 24
+
+    def test_step_at_boundary_inactive(self) -> None:
+        f = get_schedule("early_only")
+        assert f(24, TOTAL) == pytest.approx(0.0)  # 24 is not < 24
+
+    def test_mid_step_inactive(self) -> None:
+        f = get_schedule("early_only")
+        assert f(30, TOTAL) == pytest.approx(0.0)
+
+    def test_final_step_inactive(self) -> None:
+        f = get_schedule("early_only")
+        assert f(TOTAL, TOTAL) == pytest.approx(0.0)
+
+    def test_beyond_total_inactive(self) -> None:
+        f = get_schedule("early_only")
+        assert f(TOTAL + 5, TOTAL) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# get_schedule — late_only
+# ---------------------------------------------------------------------------
+
+
+class TestGetScheduleLateOnly:
+    # Boundary: TOTAL * 0.6 = 36.  Active when step >= 36.
+
+    def test_step0_inactive(self) -> None:
+        f = get_schedule("late_only")
+        assert f(0, TOTAL) == pytest.approx(0.0)
+
+    def test_step_just_before_boundary_inactive(self) -> None:
+        f = get_schedule("late_only")
+        assert f(35, TOTAL) == pytest.approx(0.0)  # 35 < 36
+
+    def test_step_at_boundary_active(self) -> None:
+        f = get_schedule("late_only")
+        assert f(36, TOTAL) == pytest.approx(1.0)  # 36 is not < 36
+
+    def test_mid_step_inactive(self) -> None:
+        f = get_schedule("late_only")
+        assert f(30, TOTAL) == pytest.approx(0.0)  # 30 < 36
+
+    def test_final_step_active(self) -> None:
+        f = get_schedule("late_only")
+        assert f(TOTAL, TOTAL) == pytest.approx(1.0)
+
+    def test_beyond_total_active(self) -> None:
+        f = get_schedule("late_only")
+        assert f(TOTAL + 5, TOTAL) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# get_schedule — invalid type
+# ---------------------------------------------------------------------------
+
+
+def test_get_schedule_invalid_raises() -> None:
+    with pytest.raises(ValueError, match="Unknown schedule type"):
+        get_schedule("unknown_type")
+
+
+# ---------------------------------------------------------------------------
+# TimestepAdaptiveSteerer — step_alpha
+# ---------------------------------------------------------------------------
+
+
+class TestStepAlpha:
+    def test_constant_preserves_base_alpha(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="constant")
+        assert steerer.step_alpha(50.0, 0, TOTAL) == pytest.approx(50.0)
+        assert steerer.step_alpha(50.0, 30, TOTAL) == pytest.approx(50.0)
+        assert steerer.step_alpha(50.0, TOTAL, TOTAL) == pytest.approx(50.0)
+
+    def test_linear_scales_correctly(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        assert steerer.step_alpha(50.0, 0, TOTAL) == pytest.approx(50.0)
+        assert steerer.step_alpha(50.0, 30, TOTAL) == pytest.approx(25.0)
+        assert steerer.step_alpha(50.0, TOTAL, TOTAL) == pytest.approx(0.0)
+
+    def test_cosine_at_step0(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="cosine")
+        assert steerer.step_alpha(100.0, 0, TOTAL) == pytest.approx(100.0)
+
+    def test_cosine_at_final(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="cosine")
+        assert steerer.step_alpha(100.0, TOTAL, TOTAL) == pytest.approx(0.0, abs=1e-6)
+
+    def test_early_only_zero_after_boundary(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="early_only")
+        assert steerer.step_alpha(80.0, 24, TOTAL) == pytest.approx(0.0)
+
+    def test_late_only_zero_before_boundary(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="late_only")
+        assert steerer.step_alpha(80.0, 35, TOTAL) == pytest.approx(0.0)
+
+    def test_late_only_full_at_boundary(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="late_only")
+        assert steerer.step_alpha(80.0, 36, TOTAL) == pytest.approx(80.0)
+
+    def test_negative_base_alpha_scales_correctly(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        assert steerer.step_alpha(-50.0, 30, TOTAL) == pytest.approx(-25.0)
+
+
+# ---------------------------------------------------------------------------
+# TimestepAdaptiveSteerer — advance_step / reset
+# ---------------------------------------------------------------------------
+
+
+class TestAdvanceStepAndReset:
+    def test_initial_step_is_zero(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="constant")
+        assert steerer._state["step"] == 0
+
+    def test_advance_step_increments(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="constant")
+        steerer.advance_step()
+        assert steerer._state["step"] == 1
+        steerer.advance_step()
+        assert steerer._state["step"] == 2
+
+    def test_reset_goes_to_zero(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="constant")
+        for _ in range(10):
+            steerer.advance_step()
+        steerer.reset()
+        assert steerer._state["step"] == 0
+
+    def test_step_alpha_reflects_advance_step(self) -> None:
+        """Calling step_alpha with current step should match the state."""
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        # At step 0, scale = 1.0
+        assert steerer.step_alpha(100.0, steerer._state["step"], TOTAL) == pytest.approx(100.0)
+        steerer.advance_step()
+        # At step 1, scale = 1 - 1/60 ≈ 0.983
+        expected = 100.0 * (1 - 1 / TOTAL)
+        assert steerer.step_alpha(100.0, steerer._state["step"], TOTAL) == pytest.approx(expected, rel=1e-5)
+
+    def test_reset_after_full_run(self) -> None:
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        for _ in range(TOTAL):
+            steerer.advance_step()
+        assert steerer._state["step"] == TOTAL
+        steerer.reset()
+        assert steerer._state["step"] == 0
+
+    def test_step_beyond_total_clamped_by_schedule(self) -> None:
+        """When step > total_steps the linear schedule should clamp to 0."""
+        _, multi = _make_bank()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        # Advance past total_steps
+        for _ in range(TOTAL + 10):
+            steerer.advance_step()
+        val = steerer.step_alpha(50.0, steerer._state["step"], TOTAL)
+        assert val == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# TimestepAdaptiveSteerer — register_scheduled_hooks
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterScheduledHooks:
+    def _model_and_steerer(
+        self, schedule_type: str = "constant", alpha: float = 50.0, dim: int = 8
+    ) -> tuple[_SimpleModel, TimestepAdaptiveSteerer]:
+        _, multi = _make_bank(dim=dim, alpha=alpha)
+        model = _SimpleModel(dim=dim)
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type=schedule_type)
+        return model, steerer
+
+    def test_returns_correct_number_of_handles(self) -> None:
+        model, steerer = self._model_and_steerer()
+        handles = steerer.register_scheduled_hooks(model, target_layers=[0, 1], total_steps=TOTAL)
+        assert len(handles) == 2
+        # Cleanup
+        steerer.multi_steerer.remove_hooks(handles)
+
+    def test_single_layer_hook(self) -> None:
+        model, steerer = self._model_and_steerer()
+        handles = steerer.register_scheduled_hooks(model, target_layers=[0], total_steps=TOTAL)
+        assert len(handles) == 1
+        steerer.multi_steerer.remove_hooks(handles)
+
+    def test_hook_modifies_output_at_nonzero_scale(self) -> None:
+        """With constant schedule and nonzero alpha, output should differ from unhooked."""
+        model, steerer = self._model_and_steerer(schedule_type="constant", alpha=50.0)
+        x = torch.ones(1, 8)
+        # Unhooked output
+        unhooked = model.layer0(x).detach().clone()
+        # Hooked output
+        handles = steerer.register_scheduled_hooks(model, target_layers=[0], total_steps=TOTAL)
+        hooked = model.layer0(x).detach().clone()
+        steerer.multi_steerer.remove_hooks(handles)
+        # The hook adds a scaled steering vector, so outputs must differ
+        assert not torch.allclose(hooked, unhooked), (
+            "Hook must change the activation when alpha != 0 and scale != 0"
         )
 
-    def test_early_only_deactivates_second_half(self) -> None:
-        T = 30
-        sched = early_only_schedule(80.0, cutoff=0.5)
-        # Second half: steps T//2 .. T-1 (t ≈ T/2 down to 1, t/T ≤ 0.5)
-        second_half = [sched(max(1, T - k), T) for k in range(T // 2, T)]
-        assert all(v == pytest.approx(0.0) for v in second_half)
+    def test_hook_no_change_when_scale_is_zero(self) -> None:
+        """At step=total_steps with linear schedule, scale=0 → output unchanged."""
+        dim = 8
+        model, steerer = self._model_and_steerer(schedule_type="linear", alpha=50.0, dim=dim)
+        # Advance to total_steps so schedule returns 0
+        for _ in range(TOTAL):
+            steerer.advance_step()
+        x = torch.ones(1, dim)
+        unhooked = model.layer0(x).detach().clone()
+        handles = steerer.register_scheduled_hooks(model, target_layers=[0], total_steps=TOTAL)
+        hooked = model.layer0(x).detach().clone()
+        steerer.multi_steerer.remove_hooks(handles)
+        assert torch.allclose(hooked, unhooked, atol=1e-6), (
+            "Hook with scale=0 must leave activation unchanged"
+        )
 
-    def test_late_only_deactivates_first_half(self) -> None:
-        T = 30
-        sched = late_only_schedule(80.0, cutoff=0.5)
-        # First half: steps 0 .. T//2-1 (t ≈ T down to T/2+1, t/T > 0.5)
-        first_half = [sched(max(1, T - k), T) for k in range(T // 2)]
-        assert all(v == pytest.approx(0.0) for v in first_half)
+    def test_hooks_removed_cleanly(self) -> None:
+        """After remove_hooks, the output matches the unhooked baseline."""
+        model, steerer = self._model_and_steerer(schedule_type="constant", alpha=50.0)
+        x = torch.ones(1, 8)
+        unhooked = model.layer0(x).detach().clone()
+        handles = steerer.register_scheduled_hooks(model, target_layers=[0], total_steps=TOTAL)
+        steerer.multi_steerer.remove_hooks(handles)
+        after_removal = model.layer0(x).detach().clone()
+        assert torch.allclose(after_removal, unhooked, atol=1e-6), (
+            "After hook removal, output must match pre-hook baseline"
+        )
+
+    def test_output_shape_unchanged(self) -> None:
+        """Hook must not change tensor shape."""
+        model, steerer = self._model_and_steerer(schedule_type="constant", alpha=50.0)
+        x = torch.ones(2, 8)  # batch=2
+        handles = steerer.register_scheduled_hooks(model, target_layers=[0], total_steps=TOTAL)
+        out = model.layer0(x)
+        steerer.multi_steerer.remove_hooks(handles)
+        assert out.shape == x.shape
+
+    def test_scale_decreases_effect_over_steps(self) -> None:
+        """With linear schedule, effect at step 0 should be larger than at step 30."""
+        dim = 8
+        _, multi = _make_bank(dim=dim, alpha=50.0)
+        model = _SimpleModel(dim=dim)
+        x = torch.ones(1, dim)
+        baseline = model.layer0(x).detach().clone()
+
+        # Measure effect at step=0
+        steerer0 = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        handles0 = steerer0.register_scheduled_hooks(model, [0], TOTAL)
+        out0 = model.layer0(x).detach().clone()
+        steerer0.multi_steerer.remove_hooks(handles0)
+        diff0 = (out0 - baseline).norm().item()
+
+        # Measure effect at step=30 (scale=0.5)
+        steerer30 = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        for _ in range(30):
+            steerer30.advance_step()
+        handles30 = steerer30.register_scheduled_hooks(model, [0], TOTAL)
+        out30 = model.layer0(x).detach().clone()
+        steerer30.multi_steerer.remove_hooks(handles30)
+        diff30 = (out30 - baseline).norm().item()
+
+        assert diff0 > diff30, "Linear schedule: effect at step 0 > effect at step 30"
+
+    def test_out_of_range_layer_hooks_model_root(self) -> None:
+        """A layer index beyond len(children) should hook the model root without error."""
+        model, steerer = self._model_and_steerer()
+        handles = steerer.register_scheduled_hooks(model, target_layers=[99], total_steps=TOTAL)
+        assert len(handles) == 1  # registered on model root
+        steerer.multi_steerer.remove_hooks(handles)
+
+    def test_hooks_live_update_with_advance_step(self) -> None:
+        """advance_step() between forward passes changes effective scale."""
+        dim = 8
+        _, multi = _make_bank(dim=dim, alpha=100.0)
+        model = _SimpleModel(dim=dim)
+        x = torch.ones(1, dim)
+        baseline = model.layer0(x).detach().clone()
+        steerer = TimestepAdaptiveSteerer(multi, schedule_type="linear")
+        handles = steerer.register_scheduled_hooks(model, [0], TOTAL)
+
+        # Step 0 → scale = 1.0
+        out_step0 = model.layer0(x).detach().clone()
+        diff0 = (out_step0 - baseline).norm().item()
+
+        # Advance to total_steps → scale = 0.0
+        for _ in range(TOTAL):
+            steerer.advance_step()
+        out_last = model.layer0(x).detach().clone()
+        diff_last = (out_last - baseline).norm().item()
+
+        steerer.multi_steerer.remove_hooks(handles)
+        assert diff0 > diff_last, (
+            "After advancing to total_steps, linear-schedule effect should be ~0"
+        )
+
+
+# ---------------------------------------------------------------------------
+# get_schedule — return type and value range
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleValueRange:
+    @pytest.mark.parametrize("stype", ["constant", "linear", "cosine", "early_only", "late_only"])
+    def test_values_in_unit_interval(self, stype: str) -> None:
+        f = get_schedule(stype)
+        for step in range(0, TOTAL + 5):
+            v = f(step, TOTAL)
+            assert 0.0 <= v <= 1.0 + 1e-9, f"Schedule {stype} returned {v} at step {step}"
+
+    @pytest.mark.parametrize("stype", ["constant", "linear", "cosine", "early_only", "late_only"])
+    def test_returns_float(self, stype: str) -> None:
+        f = get_schedule(stype)
+        assert isinstance(f(0, TOTAL), float)

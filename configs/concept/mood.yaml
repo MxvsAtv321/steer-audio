@@ -1,8 +1,15 @@
+# ============================================================
 # Concept configuration: MOOD (valence)
 # Positive class = happy/joyful; negative class = sad/melancholic.
+# ============================================================
 
 name: mood
 
+# Primary positive / negative keywords for prompt generation and CAA.
+positive_keyword: "happy mood"
+negative_keyword: "sad mood"
+
+# Extended keyword lists for richer prompt variation.
 positive_keywords:
   - happy
   - joyful
@@ -15,12 +22,12 @@ negative_keywords:
   - somber
   - gloomy
 
-# Number of top SAE features (τ).
-tau: 20
+# Number of top SAE features selected per concept via TF-IDF scoring.
+# τ=40 for mood (broader feature set needed; arXiv 2602.11910 §4.2).
+tau: 40
 
-alpha_range:
-  start: -100
-  stop: 100
-  step: 10
+# Alpha values swept during evaluation (arXiv 2602.11910 §5).
+alpha_range: [-100, -90, -80, -70, -60, -50, -40, -30, -20, -10, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
+# Metric used to measure concept alignment after steering.
 similarity_metric: clap

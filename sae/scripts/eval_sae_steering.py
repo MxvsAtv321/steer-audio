@@ -430,9 +430,15 @@ def main(
     weighting: str = "none",
     use_weighted_vectors: bool = False,
     skip_weighting: bool = False,
+    vectors_seed: int = VECTORS_SEED,
+    generation_seed: int = GENERATION_SEED,
+    multipliers: list = None,
 ):
-    """
-    Evaluate SAE-based steering for ACE-Step model.
+    """Evaluate SAE-based steering for ACE-Step model.
+
+    Generates steered audio using SAE feature interventions and saves outputs
+    in a directory structure compatible with eval_steering_protocol.py.
+    See TADA arXiv 2602.11910 §5 for the evaluation protocol.
 
     Args:
         concept: Concept to steer (piano, drums, mood, tempo, female_vocals)
@@ -453,7 +459,13 @@ def main(
         weighting: Weighting transformation (none, raw, softmax, sqrt, log)
         use_weighted_vectors: If True, use weighted SAE vectors instead of feature intervention
         skip_weighting: If True, ignore weighting from config and use simple feature selection
+        vectors_seed: Random seed used when collecting concept activations (default: 42)
+        generation_seed: Random seed used for evaluation audio generation (default: 2115)
+        multipliers: List of alpha multipliers to sweep over; defaults to the standard
+            [-50, -47.5, ..., 50] range used in the paper (TADA arXiv 2602.11910 Table 4)
     """
+    if multipliers is None:
+        multipliers = MULTIPLIERS
     # Load config from notebook if provided
     if config_path is not None:
         print(f"Loading config from {config_path}")
@@ -597,7 +609,7 @@ def main(
         latents = steered_pipe.prepare_latents(
             batch_size=len(positive_prompts),
             audio_duration=AUDIO_LENGTH_IN_S,
-            seed=VECTORS_SEED,
+            seed=vectors_seed,
         )
 
         out_pos = hooked_model.run_with_cache(
@@ -610,7 +622,7 @@ def main(
             guidance_interval_decay=ACE_STEP_GUIDANCE_INTERVAL_DECAY,
             guidance_scale_text=ACE_STEP_GUIDANCE_SCALE_TEXT,
             guidance_scale_lyric=ACE_STEP_GUIDANCE_SCALE_LYRIC,
-            manual_seed=VECTORS_SEED,
+            manual_seed=vectors_seed,
             latents=latents,
             return_type="audio",
             positions_to_cache=["transformer_blocks.7.cross_attn"],
@@ -627,7 +639,7 @@ def main(
             guidance_interval_decay=ACE_STEP_GUIDANCE_INTERVAL_DECAY,
             guidance_scale_text=ACE_STEP_GUIDANCE_SCALE_TEXT,
             guidance_scale_lyric=ACE_STEP_GUIDANCE_SCALE_LYRIC,
-            manual_seed=VECTORS_SEED,
+            manual_seed=vectors_seed,
             latents=latents,
             return_type="audio",
             positions_to_cache=["transformer_blocks.7.cross_attn"],
@@ -716,9 +728,9 @@ def main(
         "negate_for_uncond": negate_for_uncond,
         "config_path": config_path,
         "eval_prompts": eval_prompts if isinstance(eval_prompts, list) else [eval_prompts],
-        "multipliers": MULTIPLIERS,
+        "multipliers": multipliers,
         "test_prompts": TEST_PROMPTS,
-        "generation_seed": GENERATION_SEED,
+        "generation_seed": generation_seed,
         "audio_duration": AUDIO_LENGTH_IN_S,
         "num_inference_steps": NUM_INFERENCE_STEPS,
         "guidance_scale": GUIDANCE_SCALE,
@@ -730,7 +742,7 @@ def main(
     latents_test = steered_pipe.prepare_latents(
         batch_size=len(TEST_PROMPTS),
         audio_duration=AUDIO_LENGTH_IN_S,
-        seed=GENERATION_SEED,
+        seed=generation_seed,
     )
 
     # Use lyrics for vocal concepts
@@ -744,8 +756,8 @@ def main(
     block = locate_block("transformer_blocks.7.cross_attn", steered_pipe.ace_step_transformer)
 
     # Generate for each multiplier (alpha)
-    print(f"Generating audios for {len(MULTIPLIERS)} alphas...")
-    for multiplier in tqdm(MULTIPLIERS, desc="Generating"):
+    print(f"Generating audios for {len(multipliers)} alphas...")
+    for multiplier in tqdm(multipliers, desc="Generating"):
         # Create alpha directory (compatible with eval_steering_protocol.py)
         alpha_dir = os.path.join(save_dir, f"alpha_{multiplier}")
         os.makedirs(alpha_dir, exist_ok=True)
@@ -790,7 +802,7 @@ def main(
                 guidance_scale_lyric=ACE_STEP_GUIDANCE_SCALE_LYRIC,
                 guidance_interval=ACE_STEP_GUIDANCE_INTERVAL,
                 guidance_interval_decay=ACE_STEP_GUIDANCE_INTERVAL_DECAY,
-                manual_seed=GENERATION_SEED,
+                manual_seed=generation_seed,
                 latents=latents_test,
                 return_type="audio",
             )

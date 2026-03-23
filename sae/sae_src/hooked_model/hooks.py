@@ -5,7 +5,13 @@ import torch
 
 
 class SAEReconstructHook:
-    # BUG FIX: removed np.sqrt spatial reshape (image-specific dead code) — 2026-03-17
+    """Replace model activations with SAE reconstructions at inference time.
+
+    Audio activations from ACE-Step cross-attention layers have shape
+    (batch, seq_len, d_model) — a 1D sequence, not a 2D spatial grid.
+    See TADA arXiv 2602.11910 Eq. 5 for the reconstruction formula.
+    """
+
     def __init__(
         self,
         sae,
@@ -34,14 +40,13 @@ class SAEReconstructHook:
 
 
 class AblateHook:
+    """Pass-through hook for ablation experiments; returns the input unchanged.
+
+    Used to isolate the effect of a layer by bypassing its transformation.
+    """
+
     @torch.no_grad()
     def __call__(self, module, input, output):
-        # if isinstance(input, tuple):
-        #     return input[0]
-        # return input[0]
-        # return torch.zeros_like(input[0])
-        print(len(input))
-        print(input)
         return input
 
 
@@ -149,17 +154,24 @@ class StableAudioInterventionHook:
 
 
 class StableAudioAblateHook:
+    """Ablate (zero-out) all SAE features for Stable Audio activations.
+
+    Zeroes the latent activations *before* the decoder call, skipping the
+    decode entirely (see TADA arXiv 2602.11910 §4.3 ablation protocol).
+    """
+
     def __init__(
         self,
         sae,
         along_freqs=False,
         both_preds=False,
     ):
-        """Simple hook that multiplies specific SAE feature activations by a scalar.
-
+        """
         Args:
-            sae: The trained SAE model
-            along_freqs: Whether to operate along frequency axis
+            sae: The trained SAE model.
+            along_freqs: Whether to operate along the frequency axis.
+            both_preds: If True, apply to the full output instead of only the
+                conditional prediction.
         """
         self.sae = sae
         self.along_freqs = along_freqs

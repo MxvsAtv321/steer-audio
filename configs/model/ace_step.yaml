@@ -1,17 +1,36 @@
-# ACE-Step model configuration.
-# ACE-Step is a DiT-based music-generation model with 24 cross-attention transformer layers.
-# Reference: arXiv 2602.11910 — Table 1.
+# ACE-Step model configuration — TADA paper (arXiv 2602.11910).
+# ACE-Step is a DiT-based music-generation model.
 
-name: ace-step
+# Identifier used in logging, output paths, and CLI overrides.
+name: ace_step
 
-# Transformer hidden dimension (d_model).
-hidden_dim: 3072
+# Hugging Face model repository for the ACE-Step weights.
+model_id: "ACE-Step/ACE-Step"
+
+# Layers where musical concepts are most strongly localised (arXiv 2602.11910 Fig. 3).
+functional_layers: [6, 7]
 
 # Total number of cross-attention transformer layers.
-num_layers: 24
+total_layers: 24
 
-# Layers where musical concepts are most strongly localised (found via activation patching).
-functional_layers: [6, 7]
+# Input dimension to the SAE / steering hook (cross-attention output size).
+d_model: 1024
+
+# Classifier-free guidance scale used during audio generation (paper default §4.1).
+guidance_scale: 7.0
+
+# Default number of diffusion steps for generation.
+num_inference_steps: 60
+
+# Default generated audio length in seconds.
+audio_length_seconds: 30
+
+# ---- backward-compat keys (used by the activation-patching pipeline) ----
+# Transformer internal hidden dimension.
+hidden_dim: 3072
+
+# Alias kept for legacy configs that reference num_layers.
+num_layers: 24
 
 # Number of cross-attention heads.
 cross_attn_heads: 24

@@ -1,0 +1,16 @@
+[run]
+source = steer_audio, sae
+omit =
+    */tests/*
+    */venv/*
+    */__pycache__/*
+    steer_audio/cli.py
+
+[report]
+show_missing = true
+skip_covered = false
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    \.\.\.

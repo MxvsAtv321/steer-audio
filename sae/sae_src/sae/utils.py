@@ -3,9 +3,7 @@ import os
 from typing import Any, Type, TypeVar, cast
 
 import torch
-from accelerate.utils import send_to_device
 from torch import Tensor, nn
-from transformers import PreTrainedModel
 
 T = TypeVar("T")
 
@@ -187,6 +185,18 @@ def triton_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
     return TritonDecoder.apply(top_indices, top_acts, W_dec)
 
 
+def _cpu_aware_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
+    """Dispatch to eager_decode on CPU, triton_decode on GPU.
+
+    Triton kernels require CUDA pointers; fall back to the pure-PyTorch
+    eager_decode when tensors are on CPU so that unit tests and inference
+    without a GPU work correctly.
+    """
+    if top_acts.device.type == "cpu":
+        return eager_decode(top_indices, top_acts, W_dec)
+    return triton_decode(top_indices, top_acts, W_dec)
+
+
 try:
     from .kernels import TritonDecoder
 except ImportError:
@@ -197,4 +207,4 @@ else:
         print("Triton disabled, using eager implementation of SAE decoder.")
         decoder_impl = eager_decode
     else:
-        decoder_impl = triton_decode
+        decoder_impl = _cpu_aware_decode

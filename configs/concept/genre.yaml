@@ -1,8 +1,15 @@
+# ============================================================
 # Concept configuration: GENRE
-# Default positive = jazz; negative = non-jazz (generic music prompt).
+# Default: jazz vs. generic music.
+# ============================================================
 
 name: genre
 
+# Primary positive / negative keywords for prompt generation and CAA.
+positive_keyword: "jazz"
+negative_keyword: "generic music"
+
+# Extended keyword lists for richer prompt variation.
 positive_keywords:
   - jazz
   - reggae
@@ -14,12 +21,10 @@ negative_keywords:
   - generic music
   - background music
 
-# Number of top SAE features (τ).
+# Number of top SAE features selected per concept via TF-IDF scoring.
 tau: 20
 
-alpha_range:
-  start: -100
-  stop: 100
-  step: 10
+# Alpha values swept during evaluation (arXiv 2602.11910 §5).
+alpha_range: [-100, -90, -80, -70, -60, -50, -40, -30, -20, -10, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
 similarity_metric: clap

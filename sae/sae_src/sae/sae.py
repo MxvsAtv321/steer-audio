@@ -5,8 +5,6 @@ from typing import NamedTuple
 
 import einops
 import torch
-from huggingface_hub import snapshot_download
-from natsort import natsorted
 from safetensors.torch import load_model, save_model
 from torch import Tensor, nn
 
@@ -91,10 +89,12 @@ class Sae(nn.Module):
         pattern: str | None = None,
     ) -> dict[str, "Sae"]:
         """Load SAEs for multiple hookpoints on a single model and dataset."""
+        from natsort import natsorted  # lazy import: only needed for multi-layer loading
         pattern = pattern + "/*" if pattern is not None else None
         if local:
             repo_path = Path(name)
         else:
+            from huggingface_hub import snapshot_download  # lazy import
             repo_path = Path(snapshot_download(name, allow_patterns=pattern))
 
         if layers is not None:
@@ -123,6 +123,7 @@ class Sae(nn.Module):
         decoder: bool = True,
     ) -> "Sae":
         # Download from the HuggingFace Hub
+        from huggingface_hub import snapshot_download  # lazy import
         repo_path = Path(
             snapshot_download(
                 name,

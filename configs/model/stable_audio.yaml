@@ -3,8 +3,11 @@
 
 name: stable-audio-open
 
-# Transformer hidden dimension.
+# Transformer hidden dimension (also the SAE input dimension for this model).
 hidden_dim: 1536
+
+# Input dimension to the SAE / steering hook.  Matches hidden_dim for Stable Audio.
+d_model: 1536
 
 # Total number of transformer layers.
 num_layers: 24

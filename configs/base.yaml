@@ -7,8 +7,8 @@ workdir: ${oc.env:TADA_WORKDIR,${hydra:runtime.cwd}/outputs}
 # Reproducibility seed (used across patching, CAA, and SAE pipelines).
 seed: 42
 
-# Compute device.  Override with device=cpu for CPU-only runs.
-device: cuda
+# Compute device.  Override with TADA_DEVICE=cpu or device=cpu at the CLI.
+device: ${oc.env:TADA_DEVICE,cuda}
 
 # DataLoader parallelism.
 num_workers: 4

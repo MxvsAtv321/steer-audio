@@ -234,6 +234,7 @@ class TestParseAlpha:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.optional  # requires pandas
 class TestComputeAlphaSweep:
     def _make_alpha_dirs(self, base: Path, alphas=(0, 50, -50)):
         """Create minimal alpha_*/ directories with one dummy WAV each."""
@@ -296,6 +297,7 @@ class TestComputeAlphaSweep:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.optional  # requires pandas
 class TestPlotAlphaSweep:
     def _make_df(self):
         import pandas as pd
@@ -384,6 +386,7 @@ class TestMakeDryRunDirs:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.optional  # requires pandas
 class TestRunEvalSweep:
     def test_produces_csv(self, tmp_path):
         import tempfile

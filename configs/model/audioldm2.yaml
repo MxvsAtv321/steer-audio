@@ -3,8 +3,11 @@
 
 name: audioldm2
 
-# UNet hidden dimension.
+# UNet hidden dimension (also the SAE input dimension for this model).
 hidden_dim: 1024
+
+# Input dimension to the SAE / steering hook.  Matches hidden_dim for AudioLDM2.
+d_model: 1024
 
 # Total number of transformer layers in the UNet middle block.
 num_layers: 16

@@ -1,23 +1,20 @@
 # ============================================================
 # Concept configuration: TEMPO
-# Template — all other concept YAMLs follow this structure.
 # ============================================================
 
-# Human-readable name for this concept.
-# Used in logging, output paths, and report tables.
 name: tempo
 
-# Keywords that characterise the POSITIVE class of this concept.
-# These are injected into prompt templates during contrastive dataset generation,
-# e.g. "fast {base_prompt}" → "fast a jazz piece".
+# Primary positive / negative keywords for prompt generation and CAA.
+positive_keyword: "fast tempo"
+negative_keyword: "slow tempo"
+
+# Extended keyword lists for richer prompt variation.
 positive_keywords:
   - fast
   - uptempo
   - quick
   - rapid
 
-# Keywords that characterise the NEGATIVE (contrastive) class of this concept.
-# The CAA steering vector v_c = mean(pos activations) - mean(neg activations).
 negative_keywords:
   - slow
   - downtempo
@@ -25,19 +22,12 @@ negative_keywords:
   - relaxed
 
 # Number of top SAE features selected per concept via TF-IDF scoring.
-# τ in the paper (arXiv 2602.11910 Section 4.2).
-# Higher τ → richer concept representation but noisier steering vector.
+# τ in the paper (arXiv 2602.11910 §4.2).
 tau: 20
 
-# Alpha values swept during evaluation.
-# The paper tests α ∈ {-100, -90, …, 100} in steps of 10.
-# Negative α steers toward the negative class; positive toward positive.
-alpha_range:
-  start: -100
-  stop: 100
-  step: 10
+# Alpha values swept during evaluation (arXiv 2602.11910 §5).
+alpha_range: [-100, -90, -80, -70, -60, -50, -40, -30, -20, -10, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
 # Metric used to measure concept alignment after steering.
-# "clap" → CLAP text-audio similarity (fast/universal)
-# "muq"  → MUQ-T perceptual quality metric (slower, more nuanced)
-similarity_metric: clap
+# "muq" → MUQ-T perceptual quality metric (better captures tempo).
+similarity_metric: muq

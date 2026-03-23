@@ -47,25 +47,45 @@ ClapExtractor = Callable[[np.ndarray, int], np.ndarray]
 
 
 class ConceptProbe:
-    """Lightweight linear probe that detects concept presence from CLAP embeddings.
+    """Lightweight probe that detects concept presence from CLAP embeddings.
+
+    Supports two usage modes:
+
+    **Stub mode** (``clap_model=None``):
+        :meth:`score` always returns ``0.5``.  Use this in tests or when CLAP
+        weights are unavailable.
+
+    **CLAP mode** (``clap_model`` provided):
+        :meth:`score` returns the cosine similarity between the *target_prompt*
+        text embedding and the audio embedding.
 
     Training data: CLAP embeddings of generated audio with positive / negative
     concept prompts.  A logistic regression classifier is fitted on those
-    embeddings and used at inference time to return P(concept present).
+    embeddings and used at inference time to return P(concept present) via
+    :meth:`predict_proba`.
 
     Args:
         concept:        Name of the concept being probed (e.g. ``"tempo"``).
-        clap_extractor: Callable ``(audio: np.ndarray, sample_rate: int) ->
-                        np.ndarray`` that returns a 1-D CLAP embedding.
-                        Defaults to a zero-vector stub so the class can be
-                        instantiated without real CLAP weights.
+        target_prompt:  Text prompt describing the desired concept (used by
+                        :meth:`score` to compute CLAP text-audio similarity).
+        clap_model:     Full CLAP model object with ``get_text_embedding`` and
+                        ``get_audio_embedding_from_data`` methods.  When
+                        ``None``, :meth:`score` returns the stub value ``0.5``.
+        clap_extractor: *Legacy parameter.*  Callable
+                        ``(audio: np.ndarray, sample_rate: int) -> np.ndarray``
+                        used by :meth:`predict_proba`.  Defaults to a zero-
+                        vector stub.
     """
 
     def __init__(
         self,
         concept: str,
+        target_prompt: str = "",
+        clap_model: Any | None = None,
         clap_extractor: ClapExtractor | None = None,
     ) -> None:
+        self.target_prompt: str = target_prompt
+        self.clap_model: Any | None = clap_model
         self.concept = concept
         self._clap_extractor: ClapExtractor = (
             clap_extractor if clap_extractor is not None else _stub_clap_extractor
@@ -183,6 +203,74 @@ class ConceptProbe:
         return prob
 
     # ------------------------------------------------------------------ #
+    # Score / delta — diffusion-step monitoring API (Prompt 2.5)
+    # ------------------------------------------------------------------ #
+
+    def score(
+        self,
+        audio_tensor: torch.Tensor | np.ndarray,
+        sample_rate: int = 44100,
+    ) -> float:
+        """Measure concept presence for one diffusion step.
+
+        In **stub mode** (``clap_model=None``) this always returns ``0.5`` so
+        that the :class:`SelfMonitoredSteerer` can run in tests without real
+        CLAP weights.
+
+        In **CLAP mode**, computes the cosine similarity between the text
+        embedding of :attr:`target_prompt` and the audio embedding of
+        *audio_tensor*.
+
+        Args:
+            audio_tensor: Partial audio for this diffusion step.  Accepts a
+                          PyTorch tensor (any shape) or a numpy array.
+            sample_rate:  Sample rate of *audio_tensor* (default 44 100 Hz).
+
+        Returns:
+            Float in approximately [0, 1] measuring concept presence.  Exactly
+            ``0.5`` in stub mode.
+        """
+        if self.clap_model is None:
+            return 0.5
+
+        # Convert to numpy 1-D float32 for CLAP.
+        if isinstance(audio_tensor, torch.Tensor):
+            audio_np = audio_tensor.detach().cpu().float().numpy().flatten()
+        else:
+            audio_np = np.asarray(audio_tensor, dtype=np.float32).flatten()
+
+        try:
+            text_emb = self.clap_model.get_text_embedding([self.target_prompt])
+            audio_emb = self.clap_model.get_audio_embedding_from_data(
+                [audio_np], use_tensor=False
+            )
+            similarity = float(
+                np.dot(text_emb[0], audio_emb[0])
+                / (
+                    np.linalg.norm(text_emb[0]) * np.linalg.norm(audio_emb[0])
+                    + _EPS
+                )
+            )
+            # Map cosine similarity from [-1, 1] to [0, 1].
+            return (similarity + 1.0) / 2.0
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ConceptProbe.score() failed: %s — returning 0.5", exc)
+            return 0.5
+
+    def delta(self, current_score: float, previous_score: float) -> float:
+        """Return the signed change in concept score between two steps.
+
+        Args:
+            current_score:  Score at the current diffusion step.
+            previous_score: Score at the previous check step.
+
+        Returns:
+            ``current_score - previous_score``.  Positive means the concept is
+            becoming more present; negative means regression.
+        """
+        return current_score - previous_score
+
+    # ------------------------------------------------------------------ #
     # Serialisation
     # ------------------------------------------------------------------ #
 
@@ -234,16 +322,22 @@ class ConceptProbe:
 
 
 # ---------------------------------------------------------------------------
-# SelfMonitoredSteerer
+# VectorAdaptiveSteerer  (legacy vector-based implementation)
 # ---------------------------------------------------------------------------
 
 
-class SelfMonitoredSteerer:
+class VectorAdaptiveSteerer:
     """Adaptive steering that reduces alpha when concept is detected.
 
     The controller hooks into the model's transformer blocks (at each layer
     listed in *vector.layers*) and adjusts the effective alpha based on
     concept-presence probability estimated by *probe*.
+
+    .. note::
+        This is the legacy implementation used by
+        :class:`~steer_audio.pipeline.SteeringPipeline`.  For the
+        diffusion-step delta controller described in TADA Prompt 2.5, see
+        :class:`SelfMonitoredSteerer`.
 
     Args:
         vector:          Pre-computed :class:`~steer_audio.vector_bank.SteeringVector`.
@@ -386,7 +480,7 @@ class SelfMonitoredSteerer:
         for layer_idx in self.vector.layers:
             if layer_idx >= len(blocks):
                 log.warning(
-                    "SelfMonitoredSteerer: layer %d out of range (model has %d blocks), skipping.",
+                    "VectorAdaptiveSteerer: layer %d out of range (model has %d blocks), skipping.",
                     layer_idx,
                     len(blocks),
                 )
@@ -415,6 +509,11 @@ class SelfMonitoredSteerer:
         Raises:
             RuntimeError: If :meth:`steer` has not been called yet.
         """
+        if not self._trace:
+            raise RuntimeError(
+                "No monitoring trace available. Call steer() first."
+            )
+
         try:
             import pandas as pd
         except ImportError as exc:
@@ -423,11 +522,155 @@ class SelfMonitoredSteerer:
                 "Install with: pip install pandas"
             ) from exc
 
-        if not self._trace:
-            raise RuntimeError(
-                "No monitoring trace available. Call steer() first."
-            )
         return pd.DataFrame(self._trace)
+
+
+# ---------------------------------------------------------------------------
+# SelfMonitoredSteerer — diffusion-step delta controller (Prompt 2.5)
+# ---------------------------------------------------------------------------
+
+
+class SelfMonitoredSteerer:
+    """Adaptive alpha controller for diffusion-based audio steering (TADA Prompt 2.5).
+
+    Unlike the autoregressive SMITIN controller, this class gates on diffusion
+    steps: every ``check_every_n_steps`` steps it scores the partial latent
+    decode and adjusts the current alpha to converge on the target concept score.
+
+    Algorithm (per call to :meth:`update`):
+    1. If ``should_check(step)`` is False, return ``current_alpha`` unchanged.
+    2. Compute ``s = probe.score(partial_audio, sample_rate)``.
+    3. If a previous score exists, compute ``Δ = probe.delta(s, prev_score)``:
+       - Δ < 0 (concept regressing)       → ``current_alpha += alpha_step``.
+       - Δ > convergence_threshold         → ``current_alpha -= alpha_step``.
+       - |Δ| ≤ convergence_threshold        → no change.
+    4. Clamp ``current_alpha`` to ``[min_alpha, max_alpha]``.
+    5. Append *s* to score history; return updated ``current_alpha``.
+
+    Args:
+        multi_steerer:         :class:`~steer_audio.multi_steer.MultiConceptSteerer`
+                               instance to adapt.
+        probe:                 :class:`ConceptProbe` used for scoring.
+        check_every_n_steps:   How many diffusion steps between probe evaluations.
+        alpha_step:            Amount to increment / decrement alpha per check.
+        max_alpha:             Upper clamp on alpha.
+        min_alpha:             Lower clamp on alpha (default 0).
+        convergence_threshold: Minimum positive delta that triggers alpha reduction.
+    """
+
+    def __init__(
+        self,
+        multi_steerer: Any,           # MultiConceptSteerer — avoid circular import
+        probe: "ConceptProbe",
+        check_every_n_steps: int = 5,
+        alpha_step: float = 5.0,
+        max_alpha: float = 100.0,
+        min_alpha: float = 0.0,
+        convergence_threshold: float = 0.02,
+    ) -> None:
+        self._multi_steerer = multi_steerer
+        self._probe = probe
+        self.check_every_n_steps = check_every_n_steps
+        self.alpha_step = alpha_step
+        self.max_alpha = max_alpha
+        self.min_alpha = min_alpha
+        self.convergence_threshold = convergence_threshold
+
+        # Public state fields (Prompt 2.5 spec).
+        self.current_alpha: float = 0.0
+        self._step: int = 0
+        self._score_history: list[float] = []
+
+    # ------------------------------------------------------------------ #
+    # should_check
+    # ------------------------------------------------------------------ #
+
+    def should_check(self, step: int) -> bool:
+        """Return True every ``check_every_n_steps`` diffusion steps.
+
+        Args:
+            step: Current diffusion step index (0-based).
+
+        Returns:
+            ``True`` if the probe should be evaluated at *step*.
+        """
+        return (step % self.check_every_n_steps) == 0
+
+    # ------------------------------------------------------------------ #
+    # update
+    # ------------------------------------------------------------------ #
+
+    def update(
+        self,
+        partial_audio: torch.Tensor | np.ndarray,
+        sample_rate: int,
+        step: int,
+    ) -> float:
+        """Evaluate probe and update alpha for one diffusion step.
+
+        Args:
+            partial_audio: Partial audio decoded from the current latent.
+                           Can be a torch ``Tensor`` or numpy array.
+            sample_rate:   Sample rate of *partial_audio*.
+            step:          Current diffusion step index.
+
+        Returns:
+            Updated ``current_alpha`` (unchanged when not a check step).
+        """
+        if not self.should_check(step):
+            return self.current_alpha
+
+        self._step = step
+        new_score = self._probe.score(partial_audio, sample_rate)
+
+        if self._score_history:
+            prev_score = self._score_history[-1]
+            d = self._probe.delta(new_score, prev_score)
+            if d < 0:
+                # Score regressed → push harder.
+                self.current_alpha += self.alpha_step
+            elif d > self.convergence_threshold:
+                # Score improved beyond threshold → ease off.
+                self.current_alpha -= self.alpha_step
+            # else |d| ≤ threshold → no change
+
+        self._score_history.append(new_score)
+
+        # Clamp alpha.
+        self.current_alpha = max(self.min_alpha, min(self.max_alpha, self.current_alpha))
+
+        log.debug(
+            "SelfMonitoredSteerer step=%d score=%.4f alpha=%.2f",
+            step,
+            new_score,
+            self.current_alpha,
+        )
+        return self.current_alpha
+
+    # ------------------------------------------------------------------ #
+    # reset / get_history
+    # ------------------------------------------------------------------ #
+
+    def reset(self) -> None:
+        """Reset step counter, score history, and current alpha to initial state."""
+        self.current_alpha = 0.0
+        self._step = 0
+        self._score_history = []
+
+    def get_history(self) -> dict[str, list]:
+        """Return score and alpha history.
+
+        Returns:
+            Dictionary with keys ``"scores"`` (list of probe scores per check
+            step) and ``"steps"`` (list of diffusion step indices at which the
+            probe was evaluated).
+        """
+        return {
+            "scores": list(self._score_history),
+            "steps": list(range(0, self._step + 1, self.check_every_n_steps))[
+                : len(self._score_history)
+            ],
+        }
 
 
 # ---------------------------------------------------------------------------

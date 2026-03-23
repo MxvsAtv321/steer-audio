@@ -25,6 +25,7 @@ import torch.nn as nn
 from steer_audio.self_monitor import (
     ConceptProbe,
     SelfMonitoredSteerer,
+    VectorAdaptiveSteerer,
     _stub_clap_extractor,
     _get_sample_rate,
     _get_transformer_blocks,
@@ -280,17 +281,17 @@ class TestConceptProbeSaveLoad:
 
 
 # ---------------------------------------------------------------------------
-# SelfMonitoredSteerer — construction validation
+# VectorAdaptiveSteerer — construction validation (legacy vector-based steerer)
 # ---------------------------------------------------------------------------
 
 
-class TestSelfMonitoredSteererInit:
+class TestVectorAdaptiveSteererInit:
     def test_threshold_low_must_be_less_than_high(
         self, caa_vector: SteeringVector
     ) -> None:
         probe = _make_trained_probe()
         with pytest.raises(ValueError, match="threshold_low"):
-            SelfMonitoredSteerer(
+            VectorAdaptiveSteerer(
                 vector=caa_vector,
                 probe=probe,
                 alpha=50.0,
@@ -301,27 +302,27 @@ class TestSelfMonitoredSteererInit:
     def test_invalid_decay_factor_zero(self, caa_vector: SteeringVector) -> None:
         probe = _make_trained_probe()
         with pytest.raises(ValueError, match="decay_factor"):
-            SelfMonitoredSteerer(
+            VectorAdaptiveSteerer(
                 vector=caa_vector, probe=probe, alpha=50.0, decay_factor=0.0
             )
 
     def test_invalid_decay_factor_negative(self, caa_vector: SteeringVector) -> None:
         probe = _make_trained_probe()
         with pytest.raises(ValueError, match="decay_factor"):
-            SelfMonitoredSteerer(
+            VectorAdaptiveSteerer(
                 vector=caa_vector, probe=probe, alpha=50.0, decay_factor=-0.1
             )
 
     def test_invalid_check_every(self, caa_vector: SteeringVector) -> None:
         probe = _make_trained_probe()
         with pytest.raises(ValueError, match="check_every"):
-            SelfMonitoredSteerer(
+            VectorAdaptiveSteerer(
                 vector=caa_vector, probe=probe, alpha=50.0, check_every=0
             )
 
     def test_valid_construction(self, caa_vector: SteeringVector) -> None:
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(
+        steerer = VectorAdaptiveSteerer(
             vector=caa_vector, probe=probe, alpha=50.0
         )
         assert steerer.alpha == 50.0
@@ -332,15 +333,15 @@ class TestSelfMonitoredSteererInit:
 
 
 # ---------------------------------------------------------------------------
-# SelfMonitoredSteerer — steer() produces valid output
+# VectorAdaptiveSteerer — steer() produces valid output
 # ---------------------------------------------------------------------------
 
 
-class TestSelfMonitoredSteererSteer:
+class TestVectorAdaptiveSteererSteer:
     def test_steer_returns_nonzero_array(self, caa_vector: SteeringVector) -> None:
         model = _make_stub_model()
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(
+        steerer = VectorAdaptiveSteerer(
             vector=caa_vector, probe=probe, alpha=50.0
         )
         audio, sr = steerer.steer(model, "a jazz song", duration=0.1, seed=42)
@@ -351,7 +352,7 @@ class TestSelfMonitoredSteererSteer:
     def test_steer_returns_correct_sample_rate(self, caa_vector: SteeringVector) -> None:
         model = _make_stub_model()
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(
+        steerer = VectorAdaptiveSteerer(
             vector=caa_vector, probe=probe, alpha=50.0
         )
         _, sr = steerer.steer(model, "test", duration=0.1, seed=0)
@@ -361,7 +362,7 @@ class TestSelfMonitoredSteererSteer:
         """All hooks must be removed once steer() returns."""
         model = _make_stub_model(n_blocks=4)
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(
+        steerer = VectorAdaptiveSteerer(
             vector=caa_vector, probe=probe, alpha=50.0
         )
         steerer.steer(model, "test", duration=0.1, seed=0)
@@ -383,21 +384,21 @@ class TestSelfMonitoredSteererSteer:
         )
         model = _make_stub_model(n_blocks=4)
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(vector=sv, probe=probe, alpha=50.0)
+        steerer = VectorAdaptiveSteerer(vector=sv, probe=probe, alpha=50.0)
         # Should complete without error.
         audio, _ = steerer.steer(model, "test", duration=0.1, seed=0)
         assert audio is not None
 
 
 # ---------------------------------------------------------------------------
-# SelfMonitoredSteerer — monitoring trace
+# VectorAdaptiveSteerer — monitoring trace
 # ---------------------------------------------------------------------------
 
 
 class TestMonitoringTrace:
     def test_trace_raises_before_steer(self, caa_vector: SteeringVector) -> None:
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(
+        steerer = VectorAdaptiveSteerer(
             vector=caa_vector, probe=probe, alpha=50.0
         )
         with pytest.raises(RuntimeError, match="steer\\(\\) first"):
@@ -411,7 +412,7 @@ class TestMonitoringTrace:
 
         model = _make_stub_model()
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(
+        steerer = VectorAdaptiveSteerer(
             vector=caa_vector,
             probe=probe,
             alpha=50.0,
@@ -445,7 +446,7 @@ class TestMonitoringTrace:
             pytest.skip("pandas not installed")
 
         probe = _make_trained_probe()
-        steerer = SelfMonitoredSteerer(
+        steerer = VectorAdaptiveSteerer(
             vector=caa_vector, probe=probe, alpha=50.0
         )
         steerer._trace = [
@@ -553,3 +554,316 @@ class TestGetSampleRate:
     def test_defaults_to_44100(self) -> None:
         model = MagicMock(spec=[])
         assert _get_sample_rate(model) == 44100
+
+
+# ===========================================================================
+# Prompt 2.5 spec — ConceptProbe.score / delta + SelfMonitoredSteerer
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# ConceptProbe.score — stub mode and delta
+# ---------------------------------------------------------------------------
+
+
+class TestConceptProbeScoreDelta:
+    """Tests for the new diffusion-step API: score() and delta()."""
+
+    def test_score_stub_returns_0_5(self) -> None:
+        """Without a clap_model, score() always returns 0.5."""
+        probe = ConceptProbe(concept="tempo", target_prompt="fast tempo")
+        audio = torch.randn(44100)
+        assert probe.score(audio) == pytest.approx(0.5)
+
+    def test_score_stub_ignores_audio_content(self) -> None:
+        """Stub score is 0.5 regardless of audio content."""
+        probe = ConceptProbe(concept="mood", target_prompt="happy")
+        s1 = probe.score(torch.zeros(1000))
+        s2 = probe.score(torch.ones(1000) * 10.0)
+        assert s1 == pytest.approx(0.5)
+        assert s2 == pytest.approx(0.5)
+
+    def test_score_accepts_numpy_array(self) -> None:
+        """score() accepts a numpy array as well as a torch Tensor."""
+        probe = ConceptProbe(concept="tempo", target_prompt="fast")
+        audio_np = np.zeros(1000, dtype=np.float32)
+        assert probe.score(audio_np) == pytest.approx(0.5)
+
+    def test_score_respects_sample_rate_param(self) -> None:
+        """sample_rate is accepted without error in stub mode."""
+        probe = ConceptProbe(concept="tempo", target_prompt="fast")
+        assert probe.score(torch.zeros(22050), sample_rate=22050) == pytest.approx(0.5)
+
+    def test_delta_positive_when_score_increases(self) -> None:
+        """delta returns positive value when score increases."""
+        probe = ConceptProbe(concept="tempo", target_prompt="fast")
+        assert probe.delta(0.7, 0.5) == pytest.approx(0.2)
+
+    def test_delta_negative_when_score_decreases(self) -> None:
+        """delta returns negative value when score decreases (regression)."""
+        probe = ConceptProbe(concept="tempo", target_prompt="fast")
+        assert probe.delta(0.3, 0.6) == pytest.approx(-0.3)
+
+    def test_delta_zero_when_score_unchanged(self) -> None:
+        """delta returns 0.0 when scores are equal."""
+        probe = ConceptProbe(concept="tempo", target_prompt="fast")
+        assert probe.delta(0.5, 0.5) == pytest.approx(0.0)
+
+    def test_target_prompt_stored(self) -> None:
+        """target_prompt is stored as an attribute."""
+        probe = ConceptProbe(concept="tempo", target_prompt="fast upbeat music")
+        assert probe.target_prompt == "fast upbeat music"
+
+    def test_default_target_prompt_is_empty_string(self) -> None:
+        """target_prompt defaults to empty string."""
+        probe = ConceptProbe(concept="tempo")
+        assert probe.target_prompt == ""
+
+
+# ---------------------------------------------------------------------------
+# SelfMonitoredSteerer — spec-compliant (Prompt 2.5)
+# ---------------------------------------------------------------------------
+
+
+def _make_spec_probe(target_prompt: str = "fast tempo") -> ConceptProbe:
+    """ConceptProbe in stub mode (no clap_model → score always 0.5)."""
+    return ConceptProbe(concept="tempo", target_prompt=target_prompt)
+
+
+def _make_spec_steerer(
+    initial_alpha: float = 0.0,
+    alpha_step: float = 5.0,
+    min_alpha: float = 0.0,
+    max_alpha: float = 100.0,
+    convergence_threshold: float = 0.02,
+    check_every_n_steps: int = 5,
+) -> SelfMonitoredSteerer:
+    """Return a SelfMonitoredSteerer with a stub probe and MagicMock steerer."""
+    probe = _make_spec_probe()
+    multi = MagicMock()
+    steerer = SelfMonitoredSteerer(
+        multi_steerer=multi,
+        probe=probe,
+        check_every_n_steps=check_every_n_steps,
+        alpha_step=alpha_step,
+        max_alpha=max_alpha,
+        min_alpha=min_alpha,
+        convergence_threshold=convergence_threshold,
+    )
+    steerer.current_alpha = initial_alpha
+    return steerer
+
+
+class TestSelfMonitoredSteererSpec:
+    """Spec-compliant SelfMonitoredSteerer tests per Prompt 2.5."""
+
+    # --- should_check ---
+
+    def test_should_check_step_0(self) -> None:
+        """Step 0 is always a check step (0 % N == 0)."""
+        s = _make_spec_steerer(check_every_n_steps=5)
+        assert s.should_check(0) is True
+
+    def test_should_check_at_interval(self) -> None:
+        """should_check returns True exactly at multiples of check_every_n_steps."""
+        s = _make_spec_steerer(check_every_n_steps=5)
+        assert s.should_check(5) is True
+        assert s.should_check(10) is True
+        assert s.should_check(15) is True
+
+    def test_should_check_false_between_intervals(self) -> None:
+        """should_check returns False between intervals."""
+        s = _make_spec_steerer(check_every_n_steps=5)
+        for step in [1, 2, 3, 4, 6, 7, 8, 9]:
+            assert s.should_check(step) is False, f"should_check({step}) should be False"
+
+    def test_should_check_interval_1_always_true(self) -> None:
+        """With check_every_n_steps=1, every step is a check step."""
+        s = _make_spec_steerer(check_every_n_steps=1)
+        for step in range(10):
+            assert s.should_check(step) is True
+
+    # --- update — non-check step ---
+
+    def test_update_no_change_on_non_check_step(self) -> None:
+        """update() on a non-check step returns current_alpha unchanged."""
+        s = _make_spec_steerer(initial_alpha=30.0, check_every_n_steps=5)
+        alpha = s.update(torch.zeros(1000), 44100, step=3)
+        assert alpha == pytest.approx(30.0)
+
+    # --- update — stub probe returns 0.5 constantly → no delta yet on first check ---
+
+    def test_update_first_check_no_history_no_alpha_change(self) -> None:
+        """First check step has no previous score → alpha unchanged."""
+        s = _make_spec_steerer(initial_alpha=20.0, check_every_n_steps=5)
+        alpha = s.update(torch.zeros(1000), 44100, step=0)
+        assert alpha == pytest.approx(20.0)
+        assert len(s._score_history) == 1
+
+    # --- alpha increases on regression (negative delta) ---
+
+    def test_alpha_increases_when_score_regresses(self) -> None:
+        """When delta < 0 (score regressed), alpha increases by alpha_step."""
+        s = _make_spec_steerer(initial_alpha=20.0, alpha_step=5.0, check_every_n_steps=1)
+        # Inject a falling score sequence using a custom probe.
+        scores = iter([0.6, 0.4])  # second call lower than first
+
+        class _FallingProbe(ConceptProbe):
+            def score(self, audio, sample_rate=44100):  # type: ignore[override]
+                return next(scores)
+
+        s._probe = _FallingProbe(concept="tempo", target_prompt="fast")
+        s.update(torch.zeros(100), 44100, step=0)  # score=0.6, no delta yet
+        alpha = s.update(torch.zeros(100), 44100, step=1)  # score=0.4, delta=-0.2
+        assert alpha == pytest.approx(25.0), f"Expected alpha=25.0, got {alpha}"
+
+    # --- alpha decreases when score improves beyond threshold ---
+
+    def test_alpha_decreases_when_score_improves(self) -> None:
+        """When delta > convergence_threshold, alpha decreases by alpha_step."""
+        s = _make_spec_steerer(
+            initial_alpha=50.0,
+            alpha_step=5.0,
+            convergence_threshold=0.02,
+            check_every_n_steps=1,
+        )
+        scores = iter([0.3, 0.7])  # big improvement
+
+        class _RisingProbe(ConceptProbe):
+            def score(self, audio, sample_rate=44100):  # type: ignore[override]
+                return next(scores)
+
+        s._probe = _RisingProbe(concept="tempo", target_prompt="fast")
+        s.update(torch.zeros(100), 44100, step=0)  # score=0.3
+        alpha = s.update(torch.zeros(100), 44100, step=1)  # score=0.7, delta=0.4 > 0.02
+        assert alpha == pytest.approx(45.0), f"Expected alpha=45.0, got {alpha}"
+
+    # --- alpha unchanged within threshold ---
+
+    def test_alpha_unchanged_within_threshold(self) -> None:
+        """When |delta| <= convergence_threshold, alpha stays the same."""
+        threshold = 0.05
+        s = _make_spec_steerer(
+            initial_alpha=30.0,
+            alpha_step=5.0,
+            convergence_threshold=threshold,
+            check_every_n_steps=1,
+        )
+        scores = iter([0.5, 0.52])  # delta = 0.02 < threshold
+
+        class _StableProbe(ConceptProbe):
+            def score(self, audio, sample_rate=44100):  # type: ignore[override]
+                return next(scores)
+
+        s._probe = _StableProbe(concept="tempo", target_prompt="fast")
+        s.update(torch.zeros(100), 44100, step=0)
+        alpha = s.update(torch.zeros(100), 44100, step=1)
+        assert alpha == pytest.approx(30.0), f"Expected alpha unchanged at 30.0, got {alpha}"
+
+    # --- clamping ---
+
+    def test_alpha_clamped_at_max(self) -> None:
+        """Alpha must not exceed max_alpha."""
+        s = _make_spec_steerer(
+            initial_alpha=98.0, alpha_step=5.0, max_alpha=100.0, check_every_n_steps=1
+        )
+        scores = iter([0.6, 0.3])  # regression → alpha would go to 103
+
+        class _FallingProbe(ConceptProbe):
+            def score(self, audio, sample_rate=44100):  # type: ignore[override]
+                return next(scores)
+
+        s._probe = _FallingProbe(concept="tempo", target_prompt="fast")
+        s.update(torch.zeros(100), 44100, step=0)
+        alpha = s.update(torch.zeros(100), 44100, step=1)
+        assert alpha == pytest.approx(100.0), f"Expected alpha clamped to 100.0, got {alpha}"
+
+    def test_alpha_clamped_at_min(self) -> None:
+        """Alpha must not go below min_alpha."""
+        s = _make_spec_steerer(
+            initial_alpha=2.0, alpha_step=5.0, min_alpha=0.0, check_every_n_steps=1
+        )
+        scores = iter([0.3, 0.9])  # big improvement → alpha would go to -3
+
+        class _RisingProbe(ConceptProbe):
+            def score(self, audio, sample_rate=44100):  # type: ignore[override]
+                return next(scores)
+
+        s._probe = _RisingProbe(concept="tempo", target_prompt="fast")
+        s.update(torch.zeros(100), 44100, step=0)
+        alpha = s.update(torch.zeros(100), 44100, step=1)
+        assert alpha == pytest.approx(0.0), f"Expected alpha clamped to 0.0, got {alpha}"
+
+    # --- reset ---
+
+    def test_reset_clears_state(self) -> None:
+        """reset() zeroes current_alpha, _step, and _score_history."""
+        s = _make_spec_steerer(initial_alpha=40.0, check_every_n_steps=1)
+        s.update(torch.zeros(100), 44100, step=0)
+        s.update(torch.zeros(100), 44100, step=1)
+        s.reset()
+        assert s.current_alpha == pytest.approx(0.0)
+        assert s._step == 0
+        assert s._score_history == []
+
+    def test_reset_then_update_restarts_cleanly(self) -> None:
+        """After reset(), the next update behaves as if it is the first."""
+        s = _make_spec_steerer(initial_alpha=50.0, check_every_n_steps=1)
+        s.update(torch.zeros(100), 44100, step=0)
+        s.reset()
+        s.current_alpha = 50.0
+        # First update after reset: no history → no alpha change.
+        alpha = s.update(torch.zeros(100), 44100, step=0)
+        assert alpha == pytest.approx(50.0)
+        assert len(s._score_history) == 1
+
+    # --- get_history ---
+
+    def test_get_history_empty_before_any_update(self) -> None:
+        """get_history() returns empty lists before any update."""
+        s = _make_spec_steerer()
+        h = s.get_history()
+        assert h["scores"] == []
+
+    def test_get_history_accumulates_scores(self) -> None:
+        """get_history() scores list grows with each check step."""
+        s = _make_spec_steerer(check_every_n_steps=1)
+        for step in range(4):
+            s.update(torch.zeros(100), 44100, step=step)
+        h = s.get_history()
+        assert len(h["scores"]) == 4
+
+    def test_get_history_returns_dict_of_lists(self) -> None:
+        """get_history() returns a dict whose values are lists."""
+        s = _make_spec_steerer(check_every_n_steps=1)
+        s.update(torch.zeros(100), 44100, step=0)
+        h = s.get_history()
+        assert isinstance(h, dict)
+        for v in h.values():
+            assert isinstance(v, list)
+
+    # --- initial state ---
+
+    def test_initial_alpha_is_zero(self) -> None:
+        """current_alpha is 0 on construction."""
+        s = SelfMonitoredSteerer(
+            multi_steerer=MagicMock(),
+            probe=_make_spec_probe(),
+        )
+        assert s.current_alpha == pytest.approx(0.0)
+
+    def test_initial_step_is_zero(self) -> None:
+        """_step is 0 on construction."""
+        s = SelfMonitoredSteerer(
+            multi_steerer=MagicMock(),
+            probe=_make_spec_probe(),
+        )
+        assert s._step == 0
+
+    def test_initial_score_history_is_empty(self) -> None:
+        """_score_history is empty on construction."""
+        s = SelfMonitoredSteerer(
+            multi_steerer=MagicMock(),
+            probe=_make_spec_probe(),
+        )
+        assert s._score_history == []

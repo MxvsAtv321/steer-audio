@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "steer-audio"
+version = "0.1.0"
+description = "TADA! Tuning Audio Diffusion Models through Activation Steering"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.1.0",
+  "hydra-core>=1.3.0",
+  "safetensors",
+  "click>=8.0",
+  "rich",
+]
+
+[project.scripts]
+tada = "steer_audio.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["steer_audio*"]
+
+[project.optional-dependencies]
+pandas = ["pandas>=1.5"]
+gradio = ["gradio>=4.0"]
+dev = [
+  "pytest>=7",
+  "pytest-cov",
+  "ruff>=0.4",
+  "pandas>=1.5",
+  "gradio>=4.0",
+  "matplotlib>=3.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-x --tb=short -q"
+markers = [
+  "optional: tests that require optional dependencies (pandas, gradio, etc.)",
+]

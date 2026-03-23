@@ -138,3 +138,121 @@ def test_multi_concept_steering_shape():
         f"Multi-concept steering changed activation shape: "
         f"expected {h.shape}, got {h_out.shape}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. CAA vector manual computation: 5 pos / 5 neg activations, shape (16, 64)
+# ---------------------------------------------------------------------------
+
+
+def test_caa_vector_manual_computation():
+    """compute_sv matches manual (mean_pos - mean_neg) / ||diff||₂.
+
+    Uses 5 positive and 5 negative 2-D activation tensors of shape (16, 64)
+    so that the input format mirrors real cross-attention activations.
+    """
+    seq_len, dim = 16, 64
+    n = 5
+    torch.manual_seed(7)
+
+    pos = [torch.randn(seq_len, dim) for _ in range(n)]
+    neg = [torch.randn(seq_len, dim) for _ in range(n)]
+
+    # Manual computation
+    pos_mean = torch.stack([v.float() for v in pos]).mean(dim=0)   # (16, 64)
+    neg_mean = torch.stack([v.float() for v in neg]).mean(dim=0)   # (16, 64)
+    diff = pos_mean - neg_mean
+    v_manual = diff / diff.norm()
+
+    v_c = compute_sv(pos, neg)
+
+    assert v_c.shape == (seq_len, dim), (
+        f"Expected shape ({seq_len}, {dim}), got {v_c.shape}"
+    )
+    assert torch.allclose(v_c, v_manual, atol=1e-6), (
+        "compute_sv does not match manual (mean_pos - mean_neg) / ||diff||₂"
+    )
+
+    # Unit norm
+    assert abs(v_c.norm().item() - 1.0) < 1e-6, (
+        f"CAA vector should have unit norm; got {v_c.norm().item():.8f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. ReNorm preserves magnitude for specific alpha values
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("alpha", [-100.0, 0.0, 50.0, 100.0])
+def test_renorm_preserves_magnitude_for_alpha(alpha):
+    """||ReNorm(h + α·v, h)||₂ == ||h||₂ within 1e-5 for each token.
+
+    Tests the ReNorm operation for α ∈ {-100, 0, 50, 100}.
+    At α=0 the steered tensor equals h, so renorm is trivially correct;
+    for other alphas we verify magnitude preservation.
+    """
+    torch.manual_seed(13)
+    dim = 64
+    h = torch.randn(4, 16, dim)
+    v = torch.randn(dim)
+    v = v / v.norm()
+
+    h_perturbed = h.float() + alpha * v.float()
+    h_renormed = renorm(h_perturbed, h)
+
+    orig_norms = h.float().norm(dim=-1)     # (4, 16)
+    renormed_norms = h_renormed.norm(dim=-1)  # (4, 16)
+
+    assert torch.allclose(orig_norms, renormed_norms, atol=1e-5), (
+        f"α={alpha}: ReNorm failed to preserve magnitude; "
+        f"max deviation={( orig_norms - renormed_norms).abs().max().item():.2e}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. Steering injection: correct shape and norm for α=30
+# ---------------------------------------------------------------------------
+
+
+def test_steering_injection_shape_and_norm():
+    """apply_caa_steering(h, v, α=30) returns correct shape and preserves norm."""
+    torch.manual_seed(99)
+    h = torch.randn(3, 16, 64)
+    v = torch.randn(64)
+    v = v / v.norm()
+
+    h_steered = apply_caa_steering(h, v, alpha=30.0)
+
+    # Shape must match
+    assert h_steered.shape == h.shape, (
+        f"Steered shape {h_steered.shape} != input shape {h.shape}"
+    )
+
+    # ReNorm: per-token norm is preserved
+    orig_norms = h.float().norm(dim=-1)
+    steered_norms = h_steered.norm(dim=-1)
+
+    assert torch.allclose(orig_norms, steered_norms, atol=1e-5), (
+        f"α=30: per-token norm not preserved after steering; "
+        f"max deviation={( orig_norms - steered_norms).abs().max().item():.2e}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. Alpha sweep: α=0 gives exact unsteered output
+# ---------------------------------------------------------------------------
+
+
+def test_alpha_sweep_zero_is_identity():
+    """For every α in {-100, 0, 50, 100}, α=0 returns an output equal to h."""
+    torch.manual_seed(55)
+    h = torch.randn(2, 16, 64)
+    v = torch.randn(64)
+    v = v / v.norm()
+
+    h_zero = apply_caa_steering(h, v, alpha=0.0)
+
+    assert torch.allclose(h.float(), h_zero, atol=1e-6), (
+        "apply_caa_steering with α=0 should equal the unsteered input exactly."
+    )

@@ -1,31 +1,35 @@
 """
-Unified steering pipeline — Phase 2.5 (TADA roadmap integration week).
+Unified steering pipeline — Prompt 2.6 (TADA roadmap).
 
 Composes all Phase 2 components into a single entry point:
 
-  - MultiConceptSteerer   (2.1): simultaneous multi-concept injection with
-                                  optional Gram-Schmidt orthogonalization
-  - TimestepAdaptiveSteerer (2.2): per-step alpha schedules per concept
+  - SteeringVectorBank   (1.5): persistent vector storage
+  - MultiConceptSteerer   (2.1): simultaneous multi-concept injection
+  - TimestepAdaptiveSteerer (2.2): per-step alpha schedules
   - ConceptAlgebra          (2.3): algebra expressions → steering vectors
   - SelfMonitoredSteerer    (2.4): CLAP-probe adaptive alpha reduction
 
-Usage::
+New API (Prompt 2.6)::
 
     from steer_audio.pipeline import SteeringPipeline
-    from steer_audio import cosine_schedule
+    from steer_audio.vector_bank import SteeringVectorBank
+
+    bank = SteeringVectorBank()
+    pipeline = (
+        SteeringPipeline(bank, model=my_model, schedule_type="cosine")
+        .add_concept("tempo", alpha=60)
+        .add_concept("mood", alpha=40)
+    )
+    result = pipeline.generate("a jazz piano trio", dry_run=True)
+
+Legacy API (backwards-compatible)::
 
     pipeline = SteeringPipeline(
         vectors={"tempo": sv_tempo, "mood": sv_mood},
         schedules={"tempo": cosine_schedule(alpha_max=80)},
         orthogonalize=True,
     )
-    audio, sr = pipeline.steer(
-        model,
-        prompt="a jazz piano trio",
-        alphas={"tempo": 60, "mood": 40},
-        duration=30.0,
-        seed=42,
-    )
+    audio, sr = pipeline.steer(model, prompt="a jazz piano trio", alphas={"tempo": 60})
 """
 
 from __future__ import annotations
@@ -39,7 +43,11 @@ import numpy as np
 import torch
 
 from steer_audio.multi_steer import MultiConceptSteerer, _renorm
-from steer_audio.temporal_steering import TimestepSchedule, constant_schedule
+from steer_audio.temporal_steering import (
+    TimestepSchedule,
+    constant_schedule,
+    get_schedule,
+)
 from steer_audio.vector_bank import SteeringVector, SteeringVectorBank
 
 log = logging.getLogger(__name__)
@@ -144,50 +152,256 @@ def _make_adaptive_multi_hook(
 class SteeringPipeline:
     """Unified pipeline composing all Phase 2 steering components.
 
-    Provides a single ``.steer()`` entry point that dispatches internally to
-    the appropriate Phase 2 module depending on which features are configured:
+    Supports two construction styles:
 
-    * **Schedules present**: builds merged adaptive multi-concept hooks that
-      query each concept's :class:`~steer_audio.temporal_steering.TimestepSchedule`
-      at every diffusion step.
-    * **Single concept + probe**: delegates to
-      :class:`~steer_audio.self_monitor.SelfMonitoredSteerer`.
-    * **Otherwise**: delegates to
-      :class:`~steer_audio.multi_steer.MultiConceptSteerer`.
+    **New (Prompt 2.6) — fluent builder API**::
+
+        pipeline = (
+            SteeringPipeline(bank, model=model, schedule_type="cosine")
+            .add_concept("tempo", alpha=60)
+            .add_concept("mood", alpha=40)
+        )
+        result = pipeline.generate("a jazz piano trio", dry_run=True)
+
+    **Legacy — dict-of-vectors API**::
+
+        pipeline = SteeringPipeline(
+            {"tempo": sv_tempo, "mood": sv_mood},
+            schedules={"tempo": cosine_schedule(alpha_max=80)},
+        )
+        audio, sr = pipeline.steer(model, "a jazz piano", alphas={"tempo": 60})
 
     Args:
-        vectors:             Mapping ``concept_name → SteeringVector``.
-        schedules:           Optional per-concept
-                             :class:`~steer_audio.temporal_steering.TimestepSchedule`.
-                             Concepts without an entry default to a constant
-                             schedule equal to the alpha passed to :meth:`steer`.
-        probes:              Optional per-concept
-                             :class:`~steer_audio.self_monitor.ConceptProbe`
-                             for self-monitored steering (single-concept only).
-        orthogonalize:       If ``True``, applies Gram-Schmidt orthogonalization
-                             to the steering vectors before inference.
-        num_inference_steps: Total diffusion denoising steps used by the model.
-                             Required for schedule-aware steering (default 30).
+        vectors_or_bank:     Either a ``dict[str, SteeringVector]`` (legacy) or a
+                             :class:`SteeringVectorBank` (new API).
+        model:               Optional model instance; required for non-dry-run generation.
+        target_layers:       Default transformer-block indices to use when
+                             ``add_concept`` does not find layer info in the bank
+                             (default ``[6, 7]``).
+        orthogonalize:       Gram-Schmidt orthogonalize vectors before injection.
+        schedule_type:       Global default schedule type string (``"constant"``,
+                             ``"cosine"``, ``"linear"``, etc.) used by
+                             :func:`~steer_audio.temporal_steering.get_schedule`.
+        self_monitor:        Enable self-monitoring via
+                             :class:`~steer_audio.self_monitor.SelfMonitoredSteerer`.
+        monitor_every_n_steps: Step interval for self-monitoring probes.
+        schedules:           Legacy: per-concept schedule callables.
+        probes:              Legacy: per-concept ConceptProbe objects.
+        num_inference_steps: Legacy: total diffusion steps (default 30).
 
     Raises:
-        ValueError: If *vectors* is empty.
+        ValueError: If no vectors are available after construction.
     """
 
     def __init__(
         self,
-        vectors: dict[str, SteeringVector],
-        schedules: dict[str, TimestepSchedule] | None = None,
-        probes: dict[str, Any] | None = None,  # dict[str, ConceptProbe]
+        vectors_or_bank: "dict[str, SteeringVector] | SteeringVectorBank | None" = None,
+        model: Any = None,
+        target_layers: list[int] | None = None,
         orthogonalize: bool = True,
+        schedule_type: str = "constant",
+        self_monitor: bool = False,
+        monitor_every_n_steps: int = 5,
+        # Legacy keyword args for backwards compatibility
+        vectors: "dict[str, SteeringVector] | None" = None,
+        schedules: "dict[str, TimestepSchedule] | None" = None,
+        probes: "dict[str, Any] | None" = None,
         num_inference_steps: int = 30,
     ) -> None:
-        if not vectors:
+        # Handle legacy positional dict or new bank input.
+        if isinstance(vectors_or_bank, SteeringVectorBank):
+            self._bank: SteeringVectorBank | None = vectors_or_bank
+            # Populate _vectors from the bank if it already contains data,
+            # so that the legacy dict-like API continues to work.
+            self._vectors: dict[str, SteeringVector] = dict(vectors_or_bank)
+        elif isinstance(vectors_or_bank, dict):
+            # Legacy: dict[str, SteeringVector]
+            if not vectors_or_bank and vectors is None:
+                raise ValueError(
+                    "SteeringPipeline requires at least one SteeringVector."
+                )
+            self._bank = None
+            self._vectors = dict(vectors_or_bank)
+        elif vectors_or_bank is None and vectors is not None:
+            # Pure legacy keyword: vectors=...
+            self._bank = None
+            self._vectors = dict(vectors)
+        elif vectors_or_bank is None:
+            # Bank-first style with no initial vectors (add_concept later).
+            self._bank = None
+            self._vectors = {}
+        else:
+            raise TypeError(
+                f"vectors_or_bank must be a dict or SteeringVectorBank, "
+                f"got {type(vectors_or_bank).__name__}"
+            )
+
+        # Validate: if no vectors AND no bank source, raise.
+        # A SteeringVectorBank with zero entries is still valid (add_concept fills it later).
+        if not self._vectors and not isinstance(vectors_or_bank, SteeringVectorBank):
             raise ValueError("SteeringPipeline requires at least one SteeringVector.")
-        self._vectors: dict[str, SteeringVector] = dict(vectors)
+
+        self._model = model
+        self._target_layers: list[int] = target_layers or [6, 7]
+        self._orthogonalize = orthogonalize
+        self._schedule_type = schedule_type
+        self._self_monitor_enabled = self_monitor
+        self._monitor_every_n_steps = monitor_every_n_steps
+        self._num_inference_steps = num_inference_steps
+
+        # Per-concept state (legacy + new API shared).
         self._schedules: dict[str, TimestepSchedule] = dict(schedules) if schedules else {}
         self._probes: dict[str, Any] = dict(probes) if probes else {}
-        self._orthogonalize = orthogonalize
-        self._num_inference_steps = num_inference_steps
+        # New in Prompt 2.6: per-concept alphas and methods (set by add_concept).
+        self._alphas: dict[str, float] = {}
+        self._methods: dict[str, str] = {}
+
+        # Active hook handles (used by context manager and generate()).
+        self._handles: list[Any] = []
+
+    # ------------------------------------------------------------------ #
+    # Fluent builder methods (new API — Prompt 2.6)
+    # ------------------------------------------------------------------ #
+
+    def add_concept(
+        self,
+        concept: str,
+        alpha: float,
+        method: str = "caa",
+    ) -> "SteeringPipeline":
+        """Register a concept with its steering alpha.
+
+        If the concept's :class:`SteeringVector` is already in ``self._vectors``
+        or can be retrieved from the bank, it is linked immediately.
+        Otherwise the concept is registered as a pending entry; its vector must
+        be provided via the bank before :meth:`generate` is called.
+
+        Args:
+            concept: Concept name (e.g. ``"tempo"``, ``"mood"``).
+            alpha:   Steering strength.
+            method:  Vector method, ``"caa"`` (default) or ``"sae"``.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self._alphas[concept] = alpha
+        self._methods[concept] = method
+
+        # Attempt to load from bank if not already present.
+        if concept not in self._vectors and self._bank is not None:
+            sv = self._bank.get(concept, method)
+            if sv is not None:
+                self._vectors[concept] = sv
+
+        log.debug("add_concept: '%s' alpha=%.1f method=%s", concept, alpha, method)
+        return self
+
+    def remove_concept(self, concept: str) -> "SteeringPipeline":
+        """Unregister a concept from the pipeline.
+
+        Args:
+            concept: Name of a concept to remove.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self._alphas.pop(concept, None)
+        self._methods.pop(concept, None)
+        self._vectors.pop(concept, None)
+        self._schedules.pop(concept, None)
+        self._probes.pop(concept, None)
+        log.debug("remove_concept: '%s'", concept)
+        return self
+
+    def enable_self_monitoring(
+        self,
+        probe: Any,  # ConceptProbe
+        **kwargs: Any,
+    ) -> "SteeringPipeline":
+        """Enable self-monitoring with the given probe for all active concepts.
+
+        Args:
+            probe:   A :class:`~steer_audio.self_monitor.ConceptProbe`.
+            **kwargs: Extra kwargs forwarded to
+                      :class:`~steer_audio.self_monitor.SelfMonitoredSteerer`.
+
+        Returns:
+            ``self`` for fluent chaining.
+        """
+        self._self_monitor_enabled = True
+        self._monitor_kwargs = kwargs
+        # Register probe for all current concepts.
+        for concept in list(self._alphas.keys()) + list(self._vectors.keys()):
+            self._probes[concept] = probe
+        log.debug("enable_self_monitoring: probe attached to %d concept(s).", len(self._probes))
+        return self
+
+    # ------------------------------------------------------------------ #
+    # Schedule API (supports both new and legacy signatures)
+    # ------------------------------------------------------------------ #
+
+    def set_schedule(
+        self,
+        concept_or_type: str,
+        schedule: TimestepSchedule | None = None,
+    ) -> "SteeringPipeline":
+        """Set a schedule for a concept or set the global default schedule type.
+
+        **New API** — single string argument sets the global schedule type::
+
+            pipeline.set_schedule("cosine")
+
+        **Legacy API** — two arguments set a per-concept schedule::
+
+            pipeline.set_schedule("tempo", cosine_schedule(alpha_max=80))
+
+        Args:
+            concept_or_type: Either a concept name (legacy) or a schedule type
+                             string (new).
+            schedule:        Schedule callable (legacy only; omit for new API).
+
+        Returns:
+            ``self`` for fluent chaining.
+
+        Raises:
+            KeyError: (legacy mode) If *concept_or_type* is not a registered concept.
+        """
+        if schedule is None:
+            # New API: update global schedule type.
+            self._schedule_type = concept_or_type
+            log.debug("set_schedule: global type set to '%s'.", concept_or_type)
+        else:
+            # Legacy API: per-concept schedule callable.
+            if concept_or_type not in self._vectors:
+                raise KeyError(
+                    f"Concept '{concept_or_type}' is not registered.  "
+                    f"Available: {list(self._vectors.keys())}"
+                )
+            self._schedules[concept_or_type] = schedule
+            log.debug("set_schedule: per-concept schedule for '%s'.", concept_or_type)
+        return self
+
+    def set_probe(self, concept: str, probe: Any) -> "SteeringPipeline":
+        """Assign a :class:`~steer_audio.self_monitor.ConceptProbe` to a concept.
+
+        Args:
+            concept: Name of a concept already in this pipeline.
+            probe:   Trained :class:`~steer_audio.self_monitor.ConceptProbe`.
+
+        Returns:
+            ``self`` for fluent chaining.
+
+        Raises:
+            KeyError: If *concept* is not registered.
+        """
+        if concept not in self._vectors:
+            raise KeyError(
+                f"Concept '{concept}' is not registered.  "
+                f"Available: {list(self._vectors.keys())}"
+            )
+        self._probes[concept] = probe
+        log.debug("set_probe: probe attached to '%s'.", concept)
+        return self
 
     # ------------------------------------------------------------------ #
     # Factory constructors
@@ -219,13 +433,13 @@ class SteeringPipeline:
         if not vectors:
             raise ValueError(f"No steering vectors found in {directory}")
         return cls(
-            vectors=vectors,
+            vectors,
             orthogonalize=orthogonalize,
             num_inference_steps=num_inference_steps,
         )
 
     # ------------------------------------------------------------------ #
-    # Dynamic registration
+    # Dynamic registration (legacy)
     # ------------------------------------------------------------------ #
 
     def add_algebra_vector(
@@ -244,12 +458,6 @@ class SteeringPipeline:
             algebra:    :class:`~steer_audio.concept_algebra.ConceptAlgebra` instance.
             layers:     Transformer-block indices to steer.  Defaults to ``[6, 7]``.
             model_name: Model identifier for provenance metadata.
-
-        Example::
-
-            pipeline.add_algebra_vector(
-                "jazz_vocal", "jazz + female_vocal", algebra, layers=[6, 7]
-            )
         """
         feature_set = algebra.expr(expr)
         sv = algebra.to_steering_vector(
@@ -257,7 +465,6 @@ class SteeringPipeline:
             layers=layers or [6, 7],
             model_name=model_name,
         )
-        # Override the auto-generated concept name with the user-supplied key.
         sv.concept = name
         self._vectors[name] = sv
         log.info(
@@ -267,48 +474,178 @@ class SteeringPipeline:
             sv.tau,
         )
 
-    def set_schedule(self, concept: str, schedule: TimestepSchedule) -> None:
-        """Assign a timestep schedule to a registered concept.
+    # ------------------------------------------------------------------ #
+    # New generate() entry point — Prompt 2.6
+    # ------------------------------------------------------------------ #
+
+    def generate(
+        self,
+        prompt: str,
+        seed: int = 42,
+        num_inference_steps: int = 60,
+        audio_length_seconds: float = 30.0,
+        dry_run: bool = False,
+    ) -> "dict[str, Any]":
+        """Generate audio with the configured concepts.
+
+        In **dry-run** mode (``dry_run=True``) no model inference is performed.
+        The method validates configuration and returns a structured dict with
+        ``audio=None``.  This is useful for unit tests and integration checks
+        that do not require real model weights.
 
         Args:
-            concept:  Name of a concept already in this pipeline.
-            schedule: :class:`~steer_audio.temporal_steering.TimestepSchedule`
-                      to apply per diffusion step.
+            prompt:               Text prompt for audio generation.
+            seed:                 Random seed for reproducible generation.
+            num_inference_steps:  Total diffusion denoising steps.
+            audio_length_seconds: Target audio duration in seconds.
+            dry_run:              If ``True``, skip inference and return a stub result.
+
+        Returns:
+            Dict with keys:
+
+            - ``"audio"``:       numpy array of audio samples, or ``None`` in dry-run.
+            - ``"sample_rate"``: int sample rate, or ``44100`` in dry-run.
+            - ``"prompt"``:      the prompt string.
+            - ``"seed"``:        the seed used.
+            - ``"concepts"``:    list of active concept names.
+            - ``"alphas"``:      dict of ``{concept: alpha}``.
+            - ``"dry_run"``:     bool.
+            - ``"interference"`` (optional): interference report if > 1 active concept.
 
         Raises:
-            KeyError: If *concept* is not registered.
+            ValueError: If no active concepts are available.
+            RuntimeError: If ``dry_run=False`` and no model is attached.
         """
-        if concept not in self._vectors:
-            raise KeyError(
-                f"Concept '{concept}' is not registered.  "
-                f"Available: {list(self._vectors.keys())}"
+        # Determine active concepts and alphas (merge fluent + legacy).
+        alphas = {**self._alphas}
+        # Fall back to any vectors with alpha=1.0 if add_concept hasn't been called.
+        if not alphas and self._vectors:
+            alphas = {c: 1.0 for c in self._vectors}
+
+        active: dict[str, float] = {
+            c: a for c, a in alphas.items()
+            if c in self._vectors and abs(a) > _EPS
+        }
+
+        if not active:
+            raise ValueError(
+                "No active concepts with non-zero alphas found.  "
+                f"Requested: {list(alphas.keys())}  "
+                f"Registered vectors: {list(self._vectors.keys())}"
             )
-        self._schedules[concept] = schedule
-        log.debug("Set schedule for '%s'.", concept)
 
-    def set_probe(self, concept: str, probe: Any) -> None:
-        """Assign a :class:`~steer_audio.self_monitor.ConceptProbe` to a concept.
+        # Build schedule callable for each concept.
+        global_sched = get_schedule(self._schedule_type)
 
-        Self-monitoring is activated when exactly one concept with a probe is
-        active during :meth:`steer`.
+        def _get_concept_schedule(concept: str) -> TimestepSchedule:
+            if concept in self._schedules:
+                return self._schedules[concept]
+            # Wrap global schedule so it scales by the concept's base alpha.
+            base_alpha = active[concept]
+            raw_sched = global_sched
 
-        Args:
-            concept: Name of a concept already in this pipeline.
-            probe:   Trained :class:`~steer_audio.self_monitor.ConceptProbe`.
+            def _scaled(t: int, T: int) -> float:
+                return base_alpha * raw_sched(t, T)
 
-        Raises:
-            KeyError: If *concept* is not registered.
-        """
-        if concept not in self._vectors:
-            raise KeyError(
-                f"Concept '{concept}' is not registered.  "
-                f"Available: {list(self._vectors.keys())}"
+            return _scaled
+
+        # Compute interference report if multiple concepts.
+        interference: dict[str, Any] | None = None
+        if len(active) > 1:
+            interference = self.get_interference_report()
+
+        if dry_run:
+            return {
+                "audio": None,
+                "sample_rate": 44100,
+                "prompt": prompt,
+                "seed": seed,
+                "concepts": list(active.keys()),
+                "alphas": dict(active),
+                "dry_run": True,
+                **({"interference": interference} if interference is not None else {}),
+            }
+
+        # Non-dry-run: requires a model.
+        if self._model is None:
+            raise RuntimeError(
+                "generate(dry_run=False) requires a model.  "
+                "Pass model= to SteeringPipeline() or set pipeline._model."
             )
-        self._probes[concept] = probe
-        log.debug("Set ConceptProbe for '%s'.", concept)
+
+        active_vectors = {c: self._vectors[c] for c in active}
+        multi_steerer = MultiConceptSteerer(
+            active_vectors, orthogonalize=self._orthogonalize
+        )
+
+        # Build per-concept schedules (constant schedule wraps base alpha).
+        schedules_for_run: dict[str, TimestepSchedule] = {
+            c: _get_concept_schedule(c) for c in active
+        }
+
+        audio_np, sr = self._run_adaptive(
+            model=self._model,
+            prompt=prompt,
+            active=active,
+            multi_steerer=multi_steerer,
+            schedules=schedules_for_run,
+            duration=audio_length_seconds,
+            seed=seed,
+            T=num_inference_steps,
+        )
+
+        return {
+            "audio": audio_np,
+            "sample_rate": sr,
+            "prompt": prompt,
+            "seed": seed,
+            "concepts": list(active.keys()),
+            "alphas": dict(active),
+            "dry_run": False,
+            **({"interference": interference} if interference is not None else {}),
+        }
 
     # ------------------------------------------------------------------ #
-    # Inference entry point
+    # Interference report — Prompt 2.6
+    # ------------------------------------------------------------------ #
+
+    def get_interference_report(self) -> "dict[str, Any]":
+        """Return an interference report for the currently active concepts.
+
+        Delegates to :meth:`MultiConceptSteerer.interference_report`.
+
+        Returns:
+            Dict with keys ``"concepts"``, ``"cosine_matrix"``, ``"max_cosine"``,
+            ``"warnings"``, and ``"clap_deltas"``.
+        """
+        # Build a MultiConceptSteerer over all registered vectors with alpha ≠ 0.
+        alphas = {**self._alphas}
+        if not alphas and self._vectors:
+            alphas = {c: 1.0 for c in self._vectors}
+
+        active_vectors = {
+            c: self._vectors[c]
+            for c, a in alphas.items()
+            if c in self._vectors and abs(a) > _EPS
+        }
+
+        if not active_vectors:
+            return {
+                "concepts": [],
+                "cosine_matrix": np.zeros((0, 0), dtype=np.float32),
+                "max_cosine": 0.0,
+                "warnings": [],
+                "clap_deltas": {},
+            }
+
+        # Dict-based init auto-populates _active with alpha=1.0 for all concepts.
+        steerer = MultiConceptSteerer(
+            active_vectors, orthogonalize=False  # raw geometry, no orthogonalization
+        )
+        return steerer.interference_report()
+
+    # ------------------------------------------------------------------ #
+    # Legacy steer() entry point
     # ------------------------------------------------------------------ #
 
     def steer(
@@ -318,8 +655,10 @@ class SteeringPipeline:
         alphas: dict[str, float],
         duration: float = 30.0,
         seed: int = 42,
-    ) -> tuple[np.ndarray, int]:
+    ) -> "tuple[np.ndarray, int]":
         """Generate audio with multi-concept, schedule-aware steering.
+
+        **Legacy method** — prefer :meth:`generate` for new code.
 
         Dispatches internally to the appropriate Phase 2 component:
 
@@ -330,19 +669,16 @@ class SteeringPipeline:
         Args:
             model:    ACE-Step model instance (``PatchableACE`` or compatible).
             prompt:   Text prompt for audio generation.
-            alphas:   ``{concept_name: alpha_value}`` dict.  Concepts with
-                      ``alpha == 0`` are skipped.
-            duration: Target audio duration in seconds (default 30 s).
-            seed:     Random seed for reproducible generation (default 42).
+            alphas:   ``{concept_name: alpha_value}`` dict.
+            duration: Target audio duration in seconds.
+            seed:     Random seed.
 
         Returns:
-            ``(audio_array, sample_rate)`` where *audio_array* is a 1-D (mono)
-            or 2-D (stereo) float32 NumPy array.
+            ``(audio_array, sample_rate)``.
 
         Raises:
             ValueError: If no active concepts remain after filtering.
         """
-        # Keep only registered concepts with non-zero alpha.
         active: dict[str, float] = {
             c: a for c, a in alphas.items() if c in self._vectors and a != 0.0
         }
@@ -369,7 +705,6 @@ class SteeringPipeline:
                 )
                 return steerer.steer(model, prompt, duration, seed)
 
-        # Build a MultiConceptSteerer (orthogonalization is applied here).
         multi_steerer = MultiConceptSteerer(active_vectors, orthogonalize=self._orthogonalize)
 
         # ---- Path 2: adaptive multi-concept hooks (any concept has schedule) ----
@@ -385,68 +720,80 @@ class SteeringPipeline:
         return multi_steerer.steer(model, prompt, active, duration, seed)
 
     # ------------------------------------------------------------------ #
-    # Adaptive steering (multi-concept + schedules)
+    # Adaptive steering (shared by steer() and generate())
     # ------------------------------------------------------------------ #
 
     def _steer_adaptive(
         self,
         model: Any,
         prompt: str,
-        alphas: dict[str, float],
+        active: dict[str, float],
         multi_steerer: MultiConceptSteerer,
         duration: float,
         seed: int,
-    ) -> tuple[np.ndarray, int]:
-        """Run inference with per-concept timestep schedules.
-
-        Builds one adaptive forward hook per targeted transformer layer.
-        Each hook queries the concept's schedule at every diffusion step
-        to determine the effective alpha.
+    ) -> "tuple[np.ndarray, int]":
+        """Run inference with per-concept timestep schedules (legacy path).
 
         Args:
             model:         ACE-Step model instance.
             prompt:        Text prompt.
-            alphas:        Active ``{concept: alpha}`` mapping.
-            multi_steerer: A :class:`MultiConceptSteerer` (may have orthogonalized
-                           vectors).
+            active:        Active ``{concept: alpha}`` mapping.
+            multi_steerer: A :class:`MultiConceptSteerer`.
             duration:      Audio duration in seconds.
             seed:          Random seed.
 
         Returns:
             ``(audio_array, sample_rate)``.
         """
-        transformer_blocks = multi_steerer._get_transformer_blocks(model)
         T = self._num_inference_steps
+        schedules: dict[str, TimestepSchedule] = {
+            c: self._schedules.get(c, constant_schedule(a))
+            for c, a in active.items()
+        }
+        return self._run_adaptive(model, prompt, active, multi_steerer, schedules, duration, seed, T)
 
-        # Aggregate contributions per layer, wrapping bare alphas in schedules.
+    def _run_adaptive(
+        self,
+        model: Any,
+        prompt: str,
+        active: dict[str, float],
+        multi_steerer: MultiConceptSteerer,
+        schedules: dict[str, TimestepSchedule],
+        duration: float,
+        seed: int,
+        T: int,
+    ) -> "tuple[np.ndarray, int]":
+        """Core adaptive inference with hook registration / cleanup.
+
+        Args:
+            model:         ACE-Step model instance.
+            prompt:        Text prompt.
+            active:        Active ``{concept: alpha}`` mapping.
+            multi_steerer: A :class:`MultiConceptSteerer`.
+            schedules:     Per-concept schedule callables.
+            duration:      Audio duration in seconds.
+            seed:          Random seed.
+            T:             Total number of inference steps.
+
+        Returns:
+            ``(audio_array, sample_rate)``.
+        """
+        transformer_blocks = multi_steerer._get_transformer_blocks(model)
+        n_blocks = len(transformer_blocks)
+
         layer_contributions: dict[
             int, list[tuple[SteeringVector, float, TimestepSchedule]]
         ] = defaultdict(list)
 
         for concept, sv in multi_steerer.vectors.items():
-            base_alpha = alphas.get(concept, 0.0)
-            if base_alpha == 0.0:
+            base_alpha = active.get(concept, 0.0)
+            if abs(base_alpha) < _EPS:
                 continue
-            # Prefer an explicit schedule; fall back to a constant schedule at base_alpha.
-            if concept in self._schedules:
-                schedule = self._schedules[concept]
-            else:
-                schedule = constant_schedule(base_alpha)
-                # Effective alpha is baked into the schedule, so pass base=1.0.
-                # But to keep the scaling consistent we wrap: schedule(t,T)
-                # already returns the alpha, so base_alpha in the hook should be 1.0.
-                # Simpler: keep base_alpha in the contribution and let the hook scale.
-                # NOTE: when schedule is constant_schedule(base_alpha), it ignores
-                # base_alpha from the contribution list — so we pass 1.0 and let
-                # schedule carry the magnitude.
-
+            sched = schedules.get(concept, constant_schedule(base_alpha))
             for layer_idx in sv.layers:
-                layer_contributions[layer_idx].append((sv, base_alpha, schedule))
+                layer_contributions[layer_idx].append((sv, base_alpha, sched))
 
-        # Register adaptive hooks.
         handles: list[Any] = []
-        n_blocks = len(transformer_blocks)
-
         for layer_idx, contribs in layer_contributions.items():
             if layer_idx >= n_blocks:
                 log.warning(
@@ -463,9 +810,9 @@ class SteeringPipeline:
             handles.append(handle)
             log.debug("Registered adaptive multi-hook on layer %d.", layer_idx)
 
+        # Store on self so __exit__ can also clean up.
+        self._handles = handles
         try:
-            # Run inference directly (bypassing multi_steerer.steer which would
-            # register its own non-adaptive hooks and double-apply the delta).
             pipeline = getattr(model, "pipeline", model)
             audio = pipeline(
                 prompt=prompt,
@@ -486,9 +833,28 @@ class SteeringPipeline:
         finally:
             for handle in handles:
                 handle.remove()
+            self._handles = []
             log.debug("Removed %d adaptive multi-hook(s).", len(handles))
 
         return audio_np, sr
+
+    # ------------------------------------------------------------------ #
+    # Context manager — Prompt 2.6
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> "SteeringPipeline":
+        """Enter the pipeline context — returns self."""
+        self._handles = []
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        """Exit the pipeline context — remove any lingering hooks."""
+        for handle in self._handles:
+            handle.remove()
+        if self._handles:
+            log.debug("Context manager: removed %d lingering hook(s).", len(self._handles))
+        self._handles = []
+        return False  # do not suppress exceptions
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -509,20 +875,22 @@ class SteeringPipeline:
         lines = [
             "SteeringPipeline Summary",
             "=" * 56,
-            f"  {'Concept':<20} {'Method':<5} {'Layers':<12} {'Schedule':<18} Probe",
+            f"  {'Concept':<20} {'Method':<5} {'Layers':<12} {'Alpha':<8} {'Schedule':<14} Probe",
             "-" * 56,
         ]
         for name, sv in self._vectors.items():
             sched = self._schedules.get(name)
-            sched_str = getattr(sched, "__name__", repr(sched)) if sched else "constant"
+            sched_str = getattr(sched, "__name__", repr(sched)) if sched else self._schedule_type
             probe_str = "yes" if name in self._probes else "no"
             layers_str = str(sv.layers)
+            alpha_str = f"{self._alphas.get(name, '-')}"
             lines.append(
-                f"  {name:<20} {sv.method:<5} {layers_str:<12} {sched_str:<18} {probe_str}"
+                f"  {name:<20} {sv.method:<5} {layers_str:<12} {alpha_str:<8} {sched_str:<14} {probe_str}"
             )
         lines.append("-" * 56)
         lines.append(
             f"  orthogonalize={self._orthogonalize}, "
+            f"schedule_type={self._schedule_type}, "
             f"num_inference_steps={self._num_inference_steps}"
         )
         return "\n".join(lines)
@@ -531,5 +899,5 @@ class SteeringPipeline:
         return (
             f"SteeringPipeline(concepts={self.concepts}, "
             f"orthogonalize={self._orthogonalize}, "
-            f"num_inference_steps={self._num_inference_steps})"
+            f"schedule_type={self._schedule_type})"
         )
