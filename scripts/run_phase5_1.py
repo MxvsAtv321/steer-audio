@@ -396,7 +396,10 @@ def generate_steered_audio(
             controller.reset()
 
             import torchaudio  # type: ignore
-            torchaudio.save(str(wav_path), audio_output.cpu(), SAMPLE_RATE)
+            audio_tensor = audio_output.cpu()
+            if audio_tensor.ndim == 3:
+                audio_tensor = audio_tensor.squeeze(0)
+            torchaudio.save(str(wav_path), audio_tensor, SAMPLE_RATE)
             log.info("  Saved %s (alpha=%.1f)", wav_path.name, alpha)
             out_paths[alpha].append(wav_path)
 
