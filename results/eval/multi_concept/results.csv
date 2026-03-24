@@ -1,0 +1,3 @@
+concept_a,concept_b,alpha_a,alpha_b,label,clap,wav_dir
+piano,mood,1.0,1.0,piano_plus_mood,0.294607,/workspace/steer-audio/results/eval/multi_concept/piano_plus_mood
+tempo,mood,1.0,1.0,tempo_plus_mood,0.292469,/workspace/steer-audio/results/eval/multi_concept/tempo_plus_mood

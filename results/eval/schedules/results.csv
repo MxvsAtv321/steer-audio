@@ -1,0 +1,5 @@
+schedule,concept,base_alpha,clap,wav_dir
+constant,tempo,1.0,0.296203,/workspace/steer-audio/results/eval/schedules/tempo_constant
+cosine,tempo,1.0,0.289151,/workspace/steer-audio/results/eval/schedules/tempo_cosine
+early_only,tempo,1.0,0.299425,/workspace/steer-audio/results/eval/schedules/tempo_early_only
+late_only,tempo,1.0,0.280240,/workspace/steer-audio/results/eval/schedules/tempo_late_only

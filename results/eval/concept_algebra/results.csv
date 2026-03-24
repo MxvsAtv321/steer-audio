@@ -1,0 +1,2 @@
+label,expr,concept_a,weight_a,concept_b,weight_b,clap,wav_dir
+0p7_mood_plus_0p3_tempo,0.7*mood + 0.3*tempo,mood,0.7,tempo,0.3,0.317803,/workspace/steer-audio/results/eval/concept_algebra/0p7_mood_plus_0p3_tempo
