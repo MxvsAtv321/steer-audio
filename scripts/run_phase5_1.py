@@ -385,7 +385,7 @@ def generate_steered_audio(
                 audio_duration=audio_duration,
                 infer_step=infer_steps,
                 manual_seed=42,
-                return_type="pt",
+                return_type="audio",
                 use_erg_lyric=False,
                 guidance_scale_text=0.0,
                 guidance_scale_lyric=0.0,
