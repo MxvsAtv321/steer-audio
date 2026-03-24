@@ -347,10 +347,6 @@ def generate_steered_audio(
     with open(sv_path, "rb") as f:
         steering_vectors = pickle.load(f)
 
-    # Use first step-key and target layers.
-    step_keys = list(steering_vectors.keys())
-    target_step_key = step_keys[0]  # apply at first denoising step bucket
-
     num_cfg_passes = compute_num_cfg_passes(0.0, 0.0)
 
     for alpha in alphas:
@@ -372,15 +368,17 @@ def generate_steered_audio(
             )
             controller.steer = True
             controller.alpha = alpha
+            # Pass the full steering_vectors dict (all steps × all layers).
+            # Layer filtering is handled by explicit_layers in register_vector_control,
+            # which only hooks the target layers so the controller is never called
+            # with a layer name that isn't present in steering_vectors.
+            controller.steering_vectors = steering_vectors
 
-            # Inject vectors for each target layer.
-            for layer in layers:
-                if target_step_key in steering_vectors and layer in steering_vectors[target_step_key]:
-                    controller.steering_vectors = {
-                        target_step_key: {layer: steering_vectors[target_step_key][layer]}
-                    }
-
-            register_vector_control(pipe.ace_step_transformer, controller)
+            register_vector_control(
+                pipe.ace_step_transformer,
+                controller,
+                explicit_layers=layers,
+            )
 
             audio_output = pipe.generate(
                 prompt=prompt,
