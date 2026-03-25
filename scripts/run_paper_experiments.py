@@ -704,15 +704,54 @@ def compute_caa_vector(
     return save_dir
 
 
+def _normalize_sv_keys(sv: Dict) -> Dict:
+    """Convert sv.pkl step keys to integers.
+
+    Existing sv.pkl files may store step keys as strings ("0", "1", ...,
+    "step_0", ...) rather than integers.  The controller looks up steps via
+    ``self.actual_denoising_step`` which is always an integer, so all
+    downstream code must use integer keys.  This function normalises at
+    load time so the rest of the pipeline never has to care.
+
+    Strategy:
+      1. If keys are already ints → return unchanged.
+      2. If string keys are digit strings ("0", "1", ...) → cast to int.
+      3. Otherwise (e.g. "step_0") → sort lexicographically and re-index
+         as 0, 1, 2, ... preserving the order.
+    """
+    if not sv:
+        return sv
+    first_key = next(iter(sv))
+    if isinstance(first_key, int):
+        return sv  # already integers — nothing to do
+
+    # Try direct int() cast (covers "0", "1", ..., "29")
+    try:
+        converted = {int(k): v for k, v in sv.items()}
+        log.debug("Normalised sv keys from str→int (e.g. %r → %d)", first_key, int(first_key))
+        return converted
+    except (ValueError, TypeError):
+        pass
+
+    # Fallback: sort string keys and assign sequential integer indices
+    sorted_keys = sorted(sv.keys())
+    log.warning(
+        "sv.pkl has non-numeric string keys (e.g. %r) — re-indexing as 0..%d.",
+        sorted_keys[0], len(sorted_keys) - 1,
+    )
+    return {i: sv[k] for i, k in enumerate(sorted_keys)}
+
+
 def load_sv(sv_dir: Path) -> Optional[Dict]:
-    """Load sv.pkl from *sv_dir*. Returns None if missing."""
+    """Load sv.pkl from *sv_dir* and normalise step keys to integers."""
     sv_path = sv_dir / "sv.pkl"
     if not sv_path.exists():
         log.warning("sv.pkl not found at %s", sv_path)
         return None
     try:
         with open(sv_path, "rb") as f:
-            return pickle.load(f)
+            sv = pickle.load(f)
+        return _normalize_sv_keys(sv)
     except Exception as exc:
         log.error("Failed to load sv.pkl from %s: %s", sv_path, exc)
         return None
@@ -826,10 +865,14 @@ def _pad_sv_for_extra_steps(sv: Dict, extra: int = 2) -> Dict:
     copies of the last step is a safe no-op: if the extra step is never reached
     the padding is unused, and if it is reached the steering just continues with
     the final-step vector instead of crashing.
+
+    Always normalises keys to integers first so the arithmetic ``max_key + i``
+    never hits a TypeError on string keys.
     """
     if not sv:
         return sv
-    max_key = max(sv.keys())
+    sv = _normalize_sv_keys(sv)
+    max_key = max(sv.keys())          # guaranteed int after normalisation
     padded = dict(sv)
     for i in range(1, extra + 1):
         padded[max_key + i] = sv[max_key]
