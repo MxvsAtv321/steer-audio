@@ -328,12 +328,19 @@ def compute_clap_scores(
     scores = []
     try:
         import torchaudio  # type: ignore
+        import torchaudio.functional as taf  # type: ignore
+        _CLAP_SAMPLE_RATE = 48000  # laion_clap is trained at 48 kHz
         for wav_path, prompt in zip(audio_paths, prompts):
             try:
                 if not wav_path.exists() or wav_path.stat().st_size == 0:
+                    log.warning("CLAP skip — missing or empty: %s", wav_path)
                     scores.append(-1.0)
                     continue
                 waveform, sr = torchaudio.load(str(wav_path))
+                # Resample to 48 kHz — CLAP is trained at this rate; passing
+                # 44100 Hz audio without resampling produces garbage embeddings.
+                if sr != _CLAP_SAMPLE_RATE:
+                    waveform = taf.resample(waveform, sr, _CLAP_SAMPLE_RATE)
                 audio_data = waveform.mean(0).numpy()
                 a_emb = model.get_audio_embedding_from_data([audio_data], use_tensor=False)
                 t_emb = model.get_text_embedding([prompt])
@@ -343,9 +350,14 @@ def compute_clap_scores(
                 )
                 scores.append(cos)
             except Exception as exc:
-                log.warning("CLAP failed for %s: %s", wav_path.name, exc)
+                import traceback
+                log.warning(
+                    "CLAP failed for %s — score set to -1.0\n  exception: %s\n%s",
+                    wav_path.name, exc, traceback.format_exc(),
+                )
                 scores.append(-1.0)
-    except ImportError:
+    except ImportError as e:
+        log.warning("torchaudio not available for CLAP scoring: %s", e)
         scores = [-1.0] * len(audio_paths)
     return scores
 
@@ -603,17 +615,19 @@ def compute_caa_vector(
     log.info("[%s] Computing CAA vectors (%d pairs) ...", concept, n_pairs)
 
     if dry_run:
-        # Write synthetic vectors
+        # Write synthetic vectors with integer step keys — matches controller expectation
+        # (controller uses actual_denoising_step integer as dict key, NOT layer-name strings)
         rng = np.random.default_rng(abs(hash(concept)) % (2**31))
         d_model = 1024
-        step_keys = [f"tf{i}" for i in range(infer_steps)]
         sv: Dict = {}
-        for sk in step_keys:
-            sv[sk] = {}
+        for step_idx in range(infer_steps):
+            sv[step_idx] = {}
             for layer in FUNCTIONAL_LAYERS:
                 vec = rng.standard_normal(d_model).astype(np.float32)
                 vec /= (np.linalg.norm(vec) + 1e-8)
-                sv[sk][layer] = [vec]
+                sv[step_idx][layer] = [vec]
+        # Pad one extra step to guard against off-by-one if pipeline runs N+1 forward passes
+        sv[infer_steps] = sv[infer_steps - 1]
         with open(sv_path, "wb") as f:
             pickle.dump(sv, f)
         _write_json(config_path, {"concept": concept, "n_pairs": n_pairs, "dry_run": True})
@@ -751,6 +765,10 @@ def generate_audio(
     num_cfg_passes = compute_num_cfg_passes(0.0, 0.0)
     paths: List[Path] = []
 
+    # Pad sv_dict with one extra step to guard against off-by-one errors where
+    # the pipeline runs N+1 forward passes for N inference steps.
+    padded_sv = _pad_sv_for_extra_steps(sv_dict) if sv_dict else None
+
     for i, prompt in enumerate(prompts):
         wav_path = out_dir / f"p{i:03d}.wav"
         if wav_path.exists() and wav_path.stat().st_size > 0:
@@ -762,13 +780,18 @@ def generate_audio(
             save_only_cond=(steer_mode == "cond_only"),
             num_cfg_passes=num_cfg_passes,
         )
-        ctrl.steer = (alpha != 0.0 and sv_dict is not None)
+        # steer=True even for alpha=0 so the controller actively replaces the
+        # previously registered one; alpha=0 is handled inside controller.forward
+        # (it just passes the vector through unchanged).
+        ctrl.steer = (alpha != 0.0 and padded_sv is not None)
         ctrl.alpha = alpha
-        if sv_dict is not None:
-            ctrl.steering_vectors = sv_dict
+        if padded_sv is not None:
+            ctrl.steering_vectors = padded_sv
 
-        if sv_dict is not None:
-            register_vector_control(pipe.ace_step_transformer, ctrl, explicit_layers=layers)
+        # ALWAYS register a fresh controller — even for unsteered runs — to
+        # prevent the stale controller from a previous call remaining hooked
+        # with its incremented actual_denoising_step counter.
+        register_vector_control(pipe.ace_step_transformer, ctrl, explicit_layers=layers)
 
         audio_out = pipe.generate(
             prompt=prompt,
@@ -793,6 +816,24 @@ def generate_audio(
         paths.append(wav_path)
 
     return paths
+
+
+def _pad_sv_for_extra_steps(sv: Dict, extra: int = 2) -> Dict:
+    """Duplicate the final step entry so the controller never sees a KeyError.
+
+    ACE-Step's scheduler sometimes runs N+1 forward passes for N inference
+    steps (e.g. an initial or final auxiliary call).  Padding the sv dict with
+    copies of the last step is a safe no-op: if the extra step is never reached
+    the padding is unused, and if it is reached the steering just continues with
+    the final-step vector instead of crashing.
+    """
+    if not sv:
+        return sv
+    max_key = max(sv.keys())
+    padded = dict(sv)
+    for i in range(1, extra + 1):
+        padded[max_key + i] = sv[max_key]
+    return padded
 
 
 def generate_random_vector_sv(sv_ref: Dict, seed: int = 0) -> Dict:
@@ -1787,6 +1828,39 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def run_clap_diagnostic() -> None:
+    """Startup diagnostic: generate 3 s of silence, score it with CLAP.
+
+    Prints the score (should be a small positive float for 'piano music').
+    If it returns -1.0, the full exception is printed so the root cause is visible.
+    """
+    log.info("=== CLAP diagnostic ===")
+    diag_path = Path("/tmp/test_clap_diag.wav")
+    try:
+        import torchaudio  # type: ignore
+        silence = torch.zeros(1, 44100 * 3)
+        torchaudio.save(str(diag_path), silence, 44100)
+        log.info("  Wrote 3 s silence to %s", diag_path)
+    except Exception as e:
+        log.warning("  Could not write diagnostic WAV: %s", e)
+        return
+
+    clap_mod = _try_import_clap()
+    if clap_mod is None:
+        log.warning("  CLAP not available — skipping diagnostic.")
+        return
+
+    scores = compute_clap_scores([diag_path], ["piano music"], clap_mod, dry_run=False)
+    score = scores[0] if scores else -1.0
+    if score >= 0:
+        log.info("  CLAP diagnostic score (silence vs 'piano music') = %.4f  [OK]", score)
+    else:
+        log.warning(
+            "  CLAP diagnostic returned -1.0 for silence — check exceptions above. "
+            "Likely cause: wrong sample rate (need 48 kHz) or missing model weights."
+        )
+
+
 def _preflight(dry_run: bool) -> Tuple[str, Path]:
     """Check environment. Returns (device, model_path)."""
     model_path = Path(os.environ.get("ACEMODEL_PATH", "/workspace/ACE-Step"))
@@ -1850,6 +1924,10 @@ def main() -> None:
     log.info("n_test      : %d", n_test)
 
     device, model_path = _preflight(args.dry_run)
+
+    # CLAP diagnostic — run before anything else so failures surface immediately
+    if not args.dry_run:
+        run_clap_diagnostic()
 
     # Load pipeline once (reused across all experiments)
     pipe = None
