@@ -659,7 +659,15 @@ def compute_caa_vector(
                 num_cfg_passes=num_cfg_passes,
             )
             ctrl.steer = False
-            register_vector_control(pipe.ace_step_transformer, ctrl)
+            # Use explicit_layers here too — hooks only the SAME blocks that
+            # generation will register, so sv.pkl layer keys and vector dimensions
+            # are guaranteed to match.  Without this, every LinearTransformerBlock
+            # in the model is hooked, including blocks at other layers that may have
+            # different hidden dimensions (e.g. 2560 vs 1024), causing a size
+            # mismatch at generation time.
+            register_vector_control(
+                pipe.ace_step_transformer, ctrl, explicit_layers=FUNCTIONAL_LAYERS
+            )
             pipe.generate(
                 prompt=prompt,
                 audio_duration=audio_duration,
@@ -758,6 +766,72 @@ def load_sv(sv_dir: Path) -> Optional[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# sv.pkl layer validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_sv_layer_keys(sv: Dict) -> List[str]:
+    """Return the layer-name keys stored in sv.pkl (from the first step entry)."""
+    if not sv:
+        return []
+    first_step_val = next(iter(sv.values()))
+    return list(first_step_val.keys())
+
+
+def _validate_sv_layers(
+    sv: Dict,
+    requested_layers: List[str],
+    label: str = "",
+) -> List[str]:
+    """Check sv.pkl layer keys against *requested_layers* and return the safe intersection.
+
+    Logs every layer key found in sv together with its vector shape.  Warns when
+    requested layers are absent.  Raises ValueError when the intersection is empty
+    (no usable layers), pointing the user to delete the stale cache.
+
+    Args:
+        sv: Normalised sv.pkl dict.
+        requested_layers: Layers the caller wants to use (e.g. FUNCTIONAL_LAYERS).
+        label: Optional label for log messages (e.g. concept name).
+
+    Returns:
+        Sorted list of layer names that are both in sv and in requested_layers.
+    """
+    sv_layers = _get_sv_layer_keys(sv)
+
+    # Log every layer present in the sv and the shape of its stored vector.
+    first_step = next(iter(sv.values())) if sv else {}
+    shape_info = {}
+    for ln in sv_layers:
+        vecs = first_step.get(ln, [])
+        shape_info[ln] = tuple(vecs[0].shape) if vecs else "(empty)"
+    log.info("[%s] sv.pkl layer keys + shapes: %s", label, shape_info)
+
+    intersection = [l for l in requested_layers if l in sv_layers]
+    missing = [l for l in requested_layers if l not in sv_layers]
+    extra = [l for l in sv_layers if l not in requested_layers]
+
+    if missing:
+        log.warning(
+            "[%s] Requested layers %s are NOT in sv.pkl (available: %s). "
+            "If this is a stale cached vector file, delete %s and rerun to recompute.",
+            label, missing, sv_layers, label,
+        )
+    if extra:
+        log.debug("[%s] sv.pkl has extra layers not requested: %s — ignoring.", label, extra)
+    if not intersection:
+        raise ValueError(
+            f"[{label}] No overlap between requested layers {requested_layers} "
+            f"and sv.pkl layers {sv_layers}. "
+            f"Delete the cached vector directory for '{label}' and rerun so vectors "
+            f"are recomputed with the correct layer convention."
+        )
+
+    log.info("[%s] Using layers for generation: %s", label, intersection)
+    return sorted(intersection)
+
+
+# ---------------------------------------------------------------------------
 # Audio generation
 # ---------------------------------------------------------------------------
 
@@ -808,6 +882,13 @@ def generate_audio(
     # the pipeline runs N+1 forward passes for N inference steps.
     padded_sv = _pad_sv_for_extra_steps(sv_dict) if sv_dict else None
 
+    # Validate sv layer keys and derive the exact set of layers to register.
+    # This catches cases where the cached sv.pkl was computed at different layers
+    # (e.g. all layers vs only functional layers) or with different hidden dims.
+    used_layers: List[str] = layers
+    if padded_sv:
+        used_layers = _validate_sv_layers(padded_sv, layers, label=out_dir.name)
+
     for i, prompt in enumerate(prompts):
         wav_path = out_dir / f"p{i:03d}.wav"
         if wav_path.exists() and wav_path.stat().st_size > 0:
@@ -830,7 +911,9 @@ def generate_audio(
         # ALWAYS register a fresh controller — even for unsteered runs — to
         # prevent the stale controller from a previous call remaining hooked
         # with its incremented actual_denoising_step counter.
-        register_vector_control(pipe.ace_step_transformer, ctrl, explicit_layers=layers)
+        # Use used_layers (derived from sv validation) not the raw layers arg,
+        # so we only register the blocks whose dimensions match the stored vectors.
+        register_vector_control(pipe.ace_step_transformer, ctrl, explicit_layers=used_layers)
 
         audio_out = pipe.generate(
             prompt=prompt,
