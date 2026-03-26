@@ -616,9 +616,11 @@ def compute_caa_vector(
 
     if dry_run:
         # Write synthetic vectors with integer step keys — matches controller expectation
-        # (controller uses actual_denoising_step integer as dict key, NOT layer-name strings)
+        # (controller uses actual_denoising_step integer as dict key, NOT layer-name strings).
+        # Real sv.pkl has layers tf0-tf23 all shape (2560,); dry-run only needs FUNCTIONAL_LAYERS
+        # since generate_audio returns early in dry-run mode before ever reading the sv.
         rng = np.random.default_rng(abs(hash(concept)) % (2**31))
-        d_model = 1024
+        d_model = 2560  # matches real ACE-Step hidden dim for tf0-tf23
         sv: Dict = {}
         for step_idx in range(infer_steps):
             sv[step_idx] = {}
@@ -626,7 +628,6 @@ def compute_caa_vector(
                 vec = rng.standard_normal(d_model).astype(np.float32)
                 vec /= (np.linalg.norm(vec) + 1e-8)
                 sv[step_idx][layer] = [vec]
-        # Pad one extra step to guard against off-by-one if pipeline runs N+1 forward passes
         sv[infer_steps] = sv[infer_steps - 1]
         with open(sv_path, "wb") as f:
             pickle.dump(sv, f)
@@ -878,17 +879,6 @@ def generate_audio(
     num_cfg_passes = compute_num_cfg_passes(0.0, 0.0)
     paths: List[Path] = []
 
-    # Pad sv_dict with one extra step to guard against off-by-one errors where
-    # the pipeline runs N+1 forward passes for N inference steps.
-    padded_sv = _pad_sv_for_extra_steps(sv_dict) if sv_dict else None
-
-    # Validate sv layer keys and derive the exact set of layers to register.
-    # This catches cases where the cached sv.pkl was computed at different layers
-    # (e.g. all layers vs only functional layers) or with different hidden dims.
-    used_layers: List[str] = layers
-    if padded_sv:
-        used_layers = _validate_sv_layers(padded_sv, layers, label=out_dir.name)
-
     for i, prompt in enumerate(prompts):
         wav_path = out_dir / f"p{i:03d}.wav"
         if wav_path.exists() and wav_path.stat().st_size > 0:
@@ -900,20 +890,21 @@ def generate_audio(
             save_only_cond=(steer_mode == "cond_only"),
             num_cfg_passes=num_cfg_passes,
         )
-        # steer=True even for alpha=0 so the controller actively replaces the
-        # previously registered one; alpha=0 is handled inside controller.forward
-        # (it just passes the vector through unchanged).
-        ctrl.steer = (alpha != 0.0 and padded_sv is not None)
+        # Mirror smoke_test.py pattern: steer whenever sv is present.
+        # Callers already pass sv_dict=None for unsteered/baseline runs.
+        ctrl.steer = sv_dict is not None
         ctrl.alpha = alpha
-        if padded_sv is not None:
-            ctrl.steering_vectors = padded_sv
+        # Pass the full sv dict (all steps × all layers).
+        # Layer filtering is handled by explicit_layers in register_vector_control,
+        # which only hooks the target layers so the controller is never called
+        # with a layer name that isn't present in sv_dict.
+        if sv_dict is not None:
+            ctrl.steering_vectors = sv_dict
 
-        # ALWAYS register a fresh controller — even for unsteered runs — to
-        # prevent the stale controller from a previous call remaining hooked
+        # Always register a fresh controller — even for unsteered runs — to
+        # prevent a stale controller from a previous call remaining hooked
         # with its incremented actual_denoising_step counter.
-        # Use used_layers (derived from sv validation) not the raw layers arg,
-        # so we only register the blocks whose dimensions match the stored vectors.
-        register_vector_control(pipe.ace_step_transformer, ctrl, explicit_layers=used_layers)
+        register_vector_control(pipe.ace_step_transformer, ctrl, explicit_layers=layers)
 
         audio_out = pipe.generate(
             prompt=prompt,
