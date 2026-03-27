@@ -1668,9 +1668,9 @@ For each algebra pair:
 
 ## File Naming
 
-- `pair_{i:02d}_unsteered.wav` — baseline generation (no steering)
-- `pair_{i:02d}_steered.wav` — steered at α=1.0
-- `algebra/pair_{i:02d}_{label}.wav` — concept algebra result
+- `pair_00_unsteered.wav` — baseline generation (no steering)
+- `pair_00_steered.wav` — steered at α=1.0
+- `algebra/pair_00_<label>.wav` — concept algebra result
 
 ## Notes
 
