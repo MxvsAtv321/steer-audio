@@ -899,11 +899,11 @@ def generate_audio(
         # which only hooks the target layers so the controller is never called
         # with a layer name that isn't present in sv_dict.
         if sv_dict is not None:
-            # Pad the sv dict so the controller never sees a KeyError if the
-            # pipeline runs one extra forward pass beyond infer_steps (e.g. step 30
-            # for a 30-step run).  _pad_sv_for_extra_steps also normalises keys to
-            # integers, so combine_sv_dicts outputs are handled safely too.
-            ctrl.steering_vectors = _pad_sv_for_extra_steps(sv_dict)
+            # Wrap in _SafeSVDict so any out-of-range step key (e.g. 30, 31, 32…)
+            # falls back to the last available entry instead of raising KeyError.
+            # The pipeline makes a variable number of extra forward passes that
+            # cannot be predicted in advance, so static padding is not sufficient.
+            ctrl.steering_vectors = _make_safe(sv_dict)
 
         # Always register a fresh controller — even for unsteered runs — to
         # prevent a stale controller from a previous call remaining hooked
@@ -955,6 +955,34 @@ def _pad_sv_for_extra_steps(sv: Dict, extra: int = 2) -> Dict:
     for i in range(1, extra + 1):
         padded[max_key + i] = sv[max_key]
     return padded
+
+
+class _SafeSVDict(dict):
+    """sv dict subclass that falls back to the last step for any out-of-range key.
+
+    The ACE-Step pipeline makes a variable number of forward passes that can
+    exceed infer_steps by an unpredictable amount (observed: +1, +2, sometimes
+    more).  Rather than pre-padding with a fixed count, this wrapper intercepts
+    every missing integer key and returns the entry for the highest known step,
+    so steering simply holds constant at the final-step vector.
+    """
+
+    def __missing__(self, key: object) -> object:
+        if isinstance(key, int):
+            int_keys = [k for k in self if isinstance(k, int)]
+            if int_keys:
+                return self[max(int_keys)]
+        raise KeyError(key)
+
+
+def _make_safe(sv: Optional[Dict]) -> Optional[Dict]:
+    """Wrap *sv* in _SafeSVDict so out-of-range step keys never crash."""
+    if sv is None:
+        return None
+    safe = _SafeSVDict()
+    for k, v in sv.items():
+        safe[k] = v
+    return safe
 
 
 def generate_random_vector_sv(sv_ref: Dict, seed: int = 0) -> Dict:
