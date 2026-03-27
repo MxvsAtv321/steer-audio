@@ -899,7 +899,11 @@ def generate_audio(
         # which only hooks the target layers so the controller is never called
         # with a layer name that isn't present in sv_dict.
         if sv_dict is not None:
-            ctrl.steering_vectors = sv_dict
+            # Pad the sv dict so the controller never sees a KeyError if the
+            # pipeline runs one extra forward pass beyond infer_steps (e.g. step 30
+            # for a 30-step run).  _pad_sv_for_extra_steps also normalises keys to
+            # integers, so combine_sv_dicts outputs are handled safely too.
+            ctrl.steering_vectors = _pad_sv_for_extra_steps(sv_dict)
 
         # Always register a fresh controller — even for unsteered runs — to
         # prevent a stale controller from a previous call remaining hooked
