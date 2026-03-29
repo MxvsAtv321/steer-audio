@@ -3,6 +3,9 @@
 score_human_eval_muq_mulan.py — Compute MuQ-MuLan text-audio similarity for
 all existing human eval WAVs without regenerating any audio.
 
+Uses soundfile + scipy for audio loading to avoid the TorchCodec / FFmpeg
+crash that occurs when torchaudio routes through libtorchcodec on some pods.
+
 Usage:
     python scripts/score_human_eval_muq_mulan.py \
         [--root results/paper/human_eval] \
@@ -15,12 +18,14 @@ import argparse
 import csv
 import re
 import sys
+from math import gcd
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
+import numpy as np
+import soundfile as sf
 import torch
-import torchaudio
-import torchaudio.functional as taf
+from scipy.signal import resample_poly
 
 # ---------------------------------------------------------------------------
 # Concept → text mapping
@@ -35,22 +40,38 @@ CONCEPT_TEXT: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Audio helper
+# Audio helper (soundfile + scipy, no torchaudio)
 # ---------------------------------------------------------------------------
 
 
 def load_audio_mono(path: Path, target_sr: int) -> Tuple[torch.Tensor, int]:
-    """Load a WAV, resample to *target_sr*, and mix down to mono.
+    """Load a WAV with soundfile, mix to mono, resample to *target_sr*.
+
+    Uses scipy.signal.resample_poly for high-quality rational resampling
+    without requiring torchaudio or FFmpeg.
 
     Returns:
-        waveform : (1, T) float tensor at *target_sr*
-        target_sr: the sample rate of the returned waveform
+        waveform  : float32 tensor shaped (1, n_samples) at *target_sr*
+        target_sr : the sample rate of the returned waveform
     """
-    waveform, sr = torchaudio.load(str(path))
+    # sf.read returns (frames, channels) array in float64 by default
+    data, sr = sf.read(str(path), always_2d=True)  # shape: (T, C)
+
+    # Mix down to mono
+    if data.shape[1] > 1:
+        data = data.mean(axis=1)  # shape: (T,)
+    else:
+        data = data[:, 0]         # shape: (T,)
+
+    # Resample if needed
     if sr != target_sr:
-        waveform = taf.resample(waveform, sr, target_sr)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
+        g = gcd(sr, target_sr)
+        up = target_sr // g
+        down = sr // g
+        data = resample_poly(data, up, down, axis=0)
+
+    # Convert to float32 tensor shaped (1, T)
+    waveform = torch.from_numpy(data.astype(np.float32)).unsqueeze(0)
     return waveform, target_sr
 
 
@@ -99,7 +120,7 @@ def main() -> None:
     print(f"  Target sample rate: {target_sr} Hz\n")
 
     # ------------------------------------------------------------------
-    # Iterate concept directories
+    # Iterate concept directories (skip algebra)
     # ------------------------------------------------------------------
     wav_pat = re.compile(r"^pair_(\d+)_(unsteered|steered)\.wav$")
 
@@ -130,10 +151,10 @@ def main() -> None:
         for wav_path in wav_files:
             m = wav_pat.match(wav_path.name)
             if m is None:
-                continue  # skip files that don't match the naming convention
+                continue  # skip files that don't match naming convention
 
-            pair_id = m.group(1)       # e.g. "00"
-            condition = m.group(2)     # "unsteered" or "steered"
+            pair_id = m.group(1)    # e.g. "00"
+            condition = m.group(2)  # "unsteered" or "steered"
 
             waveform, _ = load_audio_mono(wav_path, target_sr)
             waveform = waveform.to(device)
