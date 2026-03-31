@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-compute_css_metric.py — Compute Concept Steering Success (CSS) from Exp 2 results.
+compute_css_metric.py — Compute CSS (Concept Steering Success) from Exp 2 results.
 
 CSS(c, w) = Pr(CLAP_steered > CLAP_unsteered | concept=c, window=w)
-Estimated as fraction of pairs where steered wins. Reported with binomial 95% CI.
-Analogous to PCI's CIS metric (Gorgun et al., arXiv:2512.08486, ICLR 2026).
+Estimated as fraction of pairs (rows) where steered wins.
+With the current aggregated CSV, n=1 per (concept, window) — this is a prototype
+that will produce real curves once exp2_timestep_commitment_raw.csv is available.
 
 Usage:
     python scripts/compute_css_metric.py \
@@ -16,17 +17,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from pathlib import Path
-from typing import Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import binomtest
+
+try:
+    from scipy.stats import binomtest
+except ImportError:
+    print(
+        "ERROR: scipy is not installed. Run: pip install scipy",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,31 +43,55 @@ CONCEPTS = ["piano", "tempo", "mood", "drums", "jazz"]
 CONCEPT_COLORS = {
     "piano": "#4C72B0",
     "tempo": "#DD8452",
-    "mood": "#55A868",
+    "mood":  "#55A868",
     "drums": "#C44E52",
-    "jazz": "#8172B3",
+    "jazz":  "#8172B3",
 }
+_FALLBACK_COLORS = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+
+def _fallback_color(i: int) -> str:
+    return _FALLBACK_COLORS[i % len(_FALLBACK_COLORS)]
 
 
 # ---------------------------------------------------------------------------
-# Core CSS computation
+# Column detection
+# ---------------------------------------------------------------------------
+
+
+def _detect_columns(df: pd.DataFrame) -> dict[str, str]:
+    """Return a mapping of role → actual column name."""
+    cols = {c: c.lower() for c in df.columns}
+    found: dict[str, str] = {}
+
+    for col, lc in cols.items():
+        if "concept" in lc and "col_concept" not in found:
+            found["col_concept"] = col
+        if lc in {"window", "window_label", "win"} and "col_window" not in found:
+            found["col_window"] = col
+        if ("window_start" in lc or lc == "start") and "col_win_start" not in found:
+            found["col_win_start"] = col
+        if ("window_end" in lc or lc == "end") and "col_win_end" not in found:
+            found["col_win_end"] = col
+        if "steered" in lc and "unsteered" not in lc and "col_steered" not in found:
+            found["col_steered"] = col
+        if "unsteered" in lc and "col_unsteered" not in found:
+            found["col_unsteered"] = col
+
+    return found
+
+
+# ---------------------------------------------------------------------------
+# CSS computation
 # ---------------------------------------------------------------------------
 
 
 def compute_css(
-    clap_steered: np.ndarray,
-    clap_unsteered: np.ndarray,
-) -> Tuple[float, float, float, float, int, int]:
-    """Compute CSS with Wilson 95% CI.
-
-    Args:
-        clap_steered:   array of steered CLAP scores
-        clap_unsteered: array of unsteered CLAP scores (same length)
-
-    Returns:
-        css, ci_lower, ci_upper, pvalue, n, n_wins
-    """
-    wins = clap_steered > clap_unsteered
+    steered: np.ndarray,
+    unsteered: np.ndarray,
+) -> tuple[float, float, float, float, int, int]:
+    """Return css, ci_lower, ci_upper, pvalue, n, n_wins."""
+    wins = steered > unsteered
     n = len(wins)
     k = int(wins.sum())
 
@@ -86,86 +117,66 @@ def main() -> None:
         "--input",
         type=Path,
         default=Path("results/paper/exp2_timestep_commitment.csv"),
-        help="Path to exp2 CSV.",
     )
     parser.add_argument(
         "--output_csv",
         type=Path,
         default=Path("results/paper/css_curves.csv"),
-        help="Output CSS curves CSV.",
     )
     parser.add_argument(
         "--output_fig",
         type=Path,
         default=Path("results/paper/figures/css_curves.png"),
-        help="Output figure path.",
     )
     args = parser.parse_args()
 
-    input_path: Path = args.input
-    output_csv: Path = args.output_csv
-    output_fig: Path = args.output_fig
-
-    if not input_path.exists():
-        print(f"ERROR: input file not found: {input_path}", file=sys.stderr)
+    if not args.input.exists():
+        print(f"ERROR: input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Load data
+    # Load + detect columns
     # ------------------------------------------------------------------
-    df = pd.read_csv(input_path)
-    print(f"Loaded {len(df)} rows from {input_path}")
-    print(f"Columns: {list(df.columns)}\n")
+    df = pd.read_csv(args.input)
+    print(f"Read {len(df)} rows from {args.input}")
 
-    # Detect column names flexibly
-    col_steered = next(
-        (c for c in df.columns if "steered" in c.lower() and "un" not in c.lower()),
-        None,
-    )
-    col_unsteered = next(
-        (c for c in df.columns if "unsteered" in c.lower()),
-        None,
-    )
-    col_concept = next(
-        (c for c in df.columns if "concept" in c.lower()),
-        "concept",
-    )
-    col_window = next(
-        (c for c in df.columns if c.lower() in ("window", "window_label", "win")),
-        "window",
-    )
-    col_window_start = next(
-        (c for c in df.columns if "window_start" in c.lower() or c.lower() == "start"),
-        None,
-    )
+    col_map = _detect_columns(df)
 
-    if col_steered is None or col_unsteered is None:
-        print("ERROR: Could not detect clap_steered/clap_unsteered columns.", file=sys.stderr)
-        print(f"Available columns: {list(df.columns)}", file=sys.stderr)
-        sys.exit(1)
+    for required in ("col_concept", "col_window", "col_steered", "col_unsteered"):
+        if required not in col_map:
+            print(
+                f"ERROR: could not detect required column '{required}' "
+                f"in columns: {list(df.columns)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-    if col_window not in df.columns and "window" in df.columns:
-        col_window = "window"
+    col_concept   = col_map["col_concept"]
+    col_window    = col_map["col_window"]
+    col_win_start = col_map.get("col_win_start")
+    col_steered   = col_map["col_steered"]
+    col_unsteered = col_map["col_unsteered"]
 
-    print(f"Using columns: concept={col_concept!r}, window={col_window!r}, "
-          f"steered={col_steered!r}, unsteered={col_unsteered!r}\n")
+    print(
+        f"Columns: concept={col_concept!r}, window={col_window!r}, "
+        f"steered={col_steered!r}, unsteered={col_unsteered!r}, "
+        f"window_start={col_win_start!r}"
+    )
 
     # ------------------------------------------------------------------
     # Compute CSS per (concept, window)
     # ------------------------------------------------------------------
     rows: list[dict] = []
 
-    grouped = df.groupby([col_concept, col_window], sort=False)
-
-    for (concept, window), grp in grouped:
-        steered_arr = grp[col_steered].values.astype(float)
+    for (concept, window), grp in df.groupby([col_concept, col_window], sort=False):
+        steered_arr   = grp[col_steered].values.astype(float)
         unsteered_arr = grp[col_unsteered].values.astype(float)
 
         css, ci_lo, ci_hi, pval, n, n_wins = compute_css(steered_arr, unsteered_arr)
 
-        # Derive window_start from label (e.g. "0.0-0.2" → 0.0)
-        if col_window_start and col_window_start in grp.columns:
-            w_start = float(grp[col_window_start].iloc[0])
+        # window_start
+        if col_win_start and col_win_start in grp.columns:
+            w_start = float(grp[col_win_start].mean())
         else:
             try:
                 w_start = float(str(window).split("-")[0])
@@ -174,88 +185,61 @@ def main() -> None:
 
         rows.append(
             {
-                "concept": concept,
-                "window": window,
+                "concept":      concept,
+                "window":       window,
                 "window_start": w_start,
-                "css": css,
-                "ci_lower": ci_lo,
-                "ci_upper": ci_hi,
-                "pvalue": pval,
-                "n_prompts": n,
-                "n_wins": n_wins,
-                "significant": pval < 0.05,
+                "css":          css,
+                "ci_lower":     ci_lo,
+                "ci_upper":     ci_hi,
+                "pvalue":       pval,
+                "n_prompts":    n,
+                "n_wins":       n_wins,
+                "significant":  bool(pval < 0.05 and css > 0.5),
             }
         )
 
     css_df = pd.DataFrame(rows).sort_values(["concept", "window_start"])
 
+    n_concepts = css_df["concept"].nunique()
+    n_windows  = css_df["window"].nunique()
+    print(f"Computed CSS for {n_concepts} concepts × {n_windows} windows = {len(css_df)} rows")
+
     # ------------------------------------------------------------------
     # Save CSV
     # ------------------------------------------------------------------
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    css_df.to_csv(output_csv, index=False)
-    print(f"Saved CSS curves to {output_csv} ({len(css_df)} rows)\n")
-
-    # ------------------------------------------------------------------
-    # Print summary table
-    # ------------------------------------------------------------------
-    print("=" * 72)
-    print("CSS SUMMARY TABLE  (* = p < 0.05)")
-    print("=" * 72)
-
-    windows_sorted = sorted(css_df["window"].unique(), key=lambda w: float(str(w).split("-")[0]))
-    concepts_present = sorted(css_df["concept"].unique())
-
-    # Header
-    header = f"{'concept':<10}" + "".join(f"{w:>12}" for w in windows_sorted)
-    print(header)
-    print("-" * len(header))
-
-    for concept in concepts_present:
-        sub = css_df[css_df["concept"] == concept].set_index("window")
-        row_str = f"{concept:<10}"
-        for w in windows_sorted:
-            if w in sub.index:
-                r = sub.loc[w]
-                star = "*" if r["significant"] else " "
-                row_str += f"  {r['css']:.3f}{star}     "
-            else:
-                row_str += f"  {'N/A':<9}"
-        print(row_str)
-
-    print("=" * 72)
-    print()
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    css_df.to_csv(args.output_csv, index=False)
+    print(f"Saved {args.output_csv}")
 
     # ------------------------------------------------------------------
     # Plot
     # ------------------------------------------------------------------
-    output_fig.parent.mkdir(parents=True, exist_ok=True)
-
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for concept in concepts_present:
-        sub = css_df[css_df["concept"] == concept].sort_values("window_start")
-        xs = sub["window_start"].values
-        ys = sub["css"].values
-        lo = sub["ci_lower"].values
-        hi = sub["ci_upper"].values
-        color = CONCEPT_COLORS.get(concept, None)
+    for i, concept in enumerate(css_df["concept"].unique()):
+        sub   = css_df[css_df["concept"] == concept].sort_values("window_start")
+        xs    = sub["window_start"].values
+        ys    = sub["css"].values
+        lo    = sub["ci_lower"].values
+        hi    = sub["ci_upper"].values
+        color = CONCEPT_COLORS.get(concept, _fallback_color(i))
 
         ax.plot(xs, ys, marker="o", linewidth=2, label=concept, color=color)
         ax.fill_between(xs, lo, hi, alpha=0.15, color=color)
 
     ax.axhline(0.5, color="black", linestyle="--", linewidth=1.0, label="Chance (0.5)")
     ax.set_xlabel("Denoising Window Start", fontsize=12)
-    ax.set_ylabel("CSS (Pr[steered > unsteered])", fontsize=12)
-    ax.set_title("Concept Steering Success by Denoising Window", fontsize=13)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_xlim(-0.05, 0.95)
+    ax.set_ylabel("CSS  Pr[steered > unsteered]", fontsize=12)
+    ax.set_title("Concept Steering Success (CSS) by Denoising Window", fontsize=13)
+    ax.set_ylim(-0.05, 1.05)
     ax.tick_params(labelsize=10)
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0, fontsize=10)
+
+    args.output_fig.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(output_fig, dpi=300, bbox_inches="tight")
+    fig.savefig(args.output_fig, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved figure to {output_fig}")
+    print(f"Saved {args.output_fig}")
 
 
 if __name__ == "__main__":
