@@ -9,7 +9,7 @@ that will produce real curves once exp2_timestep_commitment_raw.csv is available
 
 Usage:
     python scripts/compute_css_metric.py \
-        [--input results/paper/exp2_timestep_commitment.csv] \
+        [--input results/paper/exp2_timestep_commitment_raw.csv] \
         [--output_csv results/paper/css_curves.csv] \
         [--output_fig results/paper/figures/css_curves.png]
 """
@@ -116,7 +116,7 @@ def main() -> None:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("results/paper/exp2_timestep_commitment.csv"),
+        default=Path("results/paper/exp2_timestep_commitment_raw.csv"),
     )
     parser.add_argument(
         "--output_csv",

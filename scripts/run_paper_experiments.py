@@ -1206,9 +1206,12 @@ def run_exp2(
     windows = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
 
     rows: List[Dict] = []
+    raw_rows: List[Dict] = []  # one row per concept × window × prompt
+    raw_path = results_dir / "exp2_timestep_commitment_raw.csv"
 
-    # First compute unsteered baseline CLAP per concept
+    # First compute unsteered baseline CLAP per concept (store per-prompt scores too)
     unsteered_clap: Dict[str, float] = {}
+    unsteered_clap_per_prompt: Dict[str, List[float]] = {}
     for concept in concepts:
         sv_dir = compute_caa_vector(pipe, concept, device, vectors_dir, DRY_N_PAIRS if dry_run else N_PAIRS, dry_run=dry_run)
         out_dir = audio_base / "exp2" / concept / "unsteered"
@@ -1216,6 +1219,7 @@ def run_exp2(
         clap_scores = compute_clap_scores(paths, test_prompts, clap_mod, dry_run)
         valid = [s for s in clap_scores if s >= 0]
         unsteered_clap[concept] = float(np.mean(valid)) if valid else -1.0
+        unsteered_clap_per_prompt[concept] = clap_scores  # keep full per-prompt list
 
     for concept in concepts:
         sv_dir = _sv_cache_path(vectors_dir, concept)
@@ -1249,9 +1253,39 @@ def run_exp2(
             })
             log.info("  [exp2] %s window=%s  CLAP_delta=%.4f", concept, window_label, delta)
 
+            # Per-prompt raw rows
+            unsteered_scores = unsteered_clap_per_prompt.get(concept, [])
+            for prompt_idx, (s_score, u_score) in enumerate(
+                zip(clap_scores, unsteered_scores)
+            ):
+                raw_rows.append({
+                    "concept": concept,
+                    "window": window_label,
+                    "window_start": start_frac,
+                    "window_end": end_frac,
+                    "prompt_id": prompt_idx,
+                    "seed": "",
+                    "clap_steered": float(s_score),
+                    "clap_unsteered": float(u_score),
+                })
+
     out_path = results_dir / "exp2_timestep_commitment.csv"
     write_csv(out_path, rows, ["concept", "window", "window_start", "window_end",
                                "clap_steered", "clap_unsteered", "clap_delta"])
+
+    # Write per-prompt raw CSV
+    if raw_rows:
+        import csv as _csv
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_fieldnames = ["concept", "window", "window_start", "window_end",
+                          "prompt_id", "seed", "clap_steered", "clap_unsteered"]
+        with raw_path.open("w", newline="") as _f:
+            _writer = _csv.DictWriter(_f, fieldnames=raw_fieldnames)
+            _writer.writeheader()
+            _writer.writerows(raw_rows)
+        log.info("[Exp2] Wrote %d raw rows to %s", len(raw_rows), raw_path)
+    else:
+        log.warning("[Exp2] No raw rows collected; raw CSV not written.")
 
     # Plot
     _plot_exp2(rows, results_dir / "figures" / "exp2_commitment_curve.png", concepts)
