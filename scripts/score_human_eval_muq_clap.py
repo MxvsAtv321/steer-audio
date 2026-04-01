@@ -4,9 +4,9 @@ score_human_eval_muq_clap.py — Compute MuQ-MuLan text-audio similarity for
 all existing human eval WAVs without regenerating any audio.
 
 This script uses the correct MuQ-MuLan API:
-  mulan(wavs=wav_tensor)   — audio embeddings
-  mulan(texts=[text])      — text embeddings
-  mulan.calc_similarity()  — cosine similarity
+  mulan.get_audio_embeddings(wav_tensor)  — audio embeddings (B, T float32 at 24kHz)
+  mulan.get_text_embeddings([text])       — text embeddings (list of strings)
+  mulan.calc_similarity()                 — cosine similarity
 
 Uses soundfile + scipy for audio loading to avoid the TorchCodec / FFmpeg
 crash that occurs when torchaudio routes through libtorchcodec on some pods.
@@ -142,9 +142,9 @@ def main() -> None:
 
         print(f"Concept: {concept!r}  →  text: {text!r}")
 
-        # Compute text embedding once per concept using keyword arg 'texts'
+        # Compute text embedding once per concept
         with torch.no_grad():
-            text_embeds = mulan(texts=[text])
+            text_embeds = mulan.get_text_embeddings([text])
 
         wav_files = sorted(concept_dir.glob("*.wav"))
         scored = 0
@@ -160,9 +160,8 @@ def main() -> None:
             waveform, _ = load_audio_mono(wav_path, target_sr)
             waveform = waveform.to(device)
 
-            # Audio embedding using keyword arg 'wavs'
             with torch.no_grad():
-                audio_embeds = mulan(wavs=waveform)
+                audio_embeds = mulan.get_audio_embeddings(waveform)
                 sim = mulan.calc_similarity(audio_embeds, text_embeds)
 
             sim_val = float(sim.squeeze().cpu())
