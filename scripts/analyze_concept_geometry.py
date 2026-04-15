@@ -2,26 +2,30 @@
 """
 analyze_concept_geometry.py — Geometry analysis of concept steering vectors.
 
-Loads pre-computed CAA steering vectors from outputs/vectors/ (sv.pkl files)
-and computes:
-  1. Cosine similarity matrix (5×5)
+Discovers vector files for the 5 concepts (piano, tempo, mood, drums, jazz)
+under outputs/vectors/, loads them with a multi-format loader
+(torch → numpy → pickle), then computes:
+  1. 5×5 cosine similarity matrix
   2. Vector norms
-  3. Bootstrap stability (if raw activation pairs available)
-  4. PCA scatter + scree plot
+  3. PCA (up to 3 components)
 
-Output:
-  results/paper/figures/concept_geometry.png  — 3-panel figure
-  results/paper/concept_geometry.csv          — per-concept stats
+Outputs:
+  results/paper/vector_cosine_matrix.csv
+  results/paper/vector_pca.csv
+  results/paper/figures/fig2_concept_geometry.png  (+ .pdf)
+
+Paths are resolved relative to the repo root (parent of this script's
+directory), so the script works on Mac (/Users/.../steer-audio) and in
+Colab (/content/steer-audio) without any changes.
 
 Usage:
-    python scripts/analyze_concept_geometry.py \
-        [--vectors_dir outputs/vectors] \
-        [--output_dir results/paper]
+    python scripts/analyze_concept_geometry.py [--vectors_dir ...] [--output_dir ...]
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import pickle
 import sys
 import warnings
@@ -37,234 +41,199 @@ from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 
 # ---------------------------------------------------------------------------
+# Repo-relative paths  (work on Mac *and* Colab without modification)
+# ---------------------------------------------------------------------------
+
+REPO_ROOT: Path = Path(__file__).resolve().parents[1]
+DEFAULT_VECTORS_DIR: Path = REPO_ROOT / "outputs" / "vectors"
+DEFAULT_OUTPUT_DIR: Path = REPO_ROOT / "results" / "paper"
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 CONCEPTS = ["piano", "tempo", "mood", "drums", "jazz"]
-# Sub-directory name patterns to check (RunPod may have drums/jazz)
-VECTOR_DIR_PATTERNS = [
-    "ace_{concept}_passes2_allTrue",
-    "ace_{concept}",
-    "{concept}",
-]
-LAYER_PRIORITY = ["tf7", "tf6"]  # preferred layers for representative vector
-N_BOOTSTRAP = 100
-BOOTSTRAP_FRAC = 0.5
+LAYER_PRIORITY = ["tf7", "tf6"]   # preferred layers when sv.pkl is a step-dict
 
 
 # ---------------------------------------------------------------------------
-# Vector loading
+# Multi-format loader
 # ---------------------------------------------------------------------------
 
+def _try_loaders(path: Path) -> tuple[object, str] | tuple[None, None]:
+    """Try torch → numpy → pickle in order.  Return (obj, loader_name) or (None, None)."""
+    # 1. torch.load
+    try:
+        import torch
+        obj = torch.load(str(path), weights_only=False)
+        return obj, "torch.load"
+    except Exception:
+        pass
 
-def find_sv_pkl(vectors_dir: Path, concept: str) -> Path | None:
-    """Search for sv.pkl for a given concept under vectors_dir."""
-    for pattern in VECTOR_DIR_PATTERNS:
-        candidate = vectors_dir / pattern.format(concept=concept) / "sv.pkl"
-        if candidate.exists():
-            return candidate
-    # Fallback: recursive search
-    for p in vectors_dir.rglob("sv.pkl"):
-        if concept in p.parts:
-            return p
+    # 2. np.load
+    try:
+        obj = np.load(str(path), allow_pickle=True)
+        return obj, "np.load"
+    except Exception:
+        pass
+
+    # 3. pickle
+    try:
+        with open(path, "rb") as fh:
+            obj = pickle.load(fh)
+        return obj, "pickle.load"
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _to_1d_float32(obj: object) -> np.ndarray | None:
+    """Flatten any supported object to a 1-D float32 numpy array."""
+    # torch Tensor
+    try:
+        import torch
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().float().numpy().ravel()
+    except ImportError:
+        pass
+
+    # plain ndarray or numpy scalar
+    if isinstance(obj, np.ndarray):
+        return obj.astype(np.float32).ravel()
+
+    # numpy 0-d array wrapped in object array (np.load result)
+    if isinstance(obj, np.ndarray) and obj.ndim == 0:
+        inner = obj.item()
+        return _to_1d_float32(inner)
+
+    # sv.pkl format: {int_step: {layer_name: [np.ndarray]}}
+    if isinstance(obj, dict):
+        return _extract_sv_pkl(obj)
+
+    # list / tuple of arrays
+    if isinstance(obj, (list, tuple)) and len(obj) > 0:
+        first = obj[0]
+        try:
+            import torch
+            if isinstance(first, torch.Tensor):
+                return first.detach().cpu().float().numpy().ravel()
+        except ImportError:
+            pass
+        if isinstance(first, np.ndarray):
+            return first.astype(np.float32).ravel()
+
     return None
 
 
-def extract_mean_vector(sv: dict, layer: str) -> np.ndarray | None:
-    """Extract and average the steering vectors across all timesteps for a layer.
+def _extract_sv_pkl(sv: dict) -> np.ndarray | None:
+    """Average steering vectors across timesteps from sv.pkl step-dict format."""
+    vecs: list[np.ndarray] = []
+    for step_val in sv.values():
+        # step_val is either {layer: [...]} or a direct array
+        if isinstance(step_val, dict):
+            layer_dict = step_val
+        else:
+            layer_dict = {"_": step_val}
 
-    sv.pkl format: {int_step: {layer_name: [np.ndarray]}}
-    """
-    vecs = []
-    for step_key, layer_dict in sv.items():
-        if layer in layer_dict:
+        # prefer tf7 / tf6, then anything
+        for layer in LAYER_PRIORITY + sorted(
+            k for k in layer_dict if k not in LAYER_PRIORITY
+        ):
+            if layer not in layer_dict:
+                continue
             arr = layer_dict[layer]
             if isinstance(arr, list):
                 arr = arr[0]
-            if hasattr(arr, "cpu"):
-                arr = arr.cpu().float().numpy()
-            vecs.append(np.asarray(arr, dtype=np.float32).ravel())
+            try:
+                import torch
+                if isinstance(arr, torch.Tensor):
+                    arr = arr.detach().cpu().float().numpy()
+            except ImportError:
+                pass
+            if isinstance(arr, np.ndarray) and arr.size > 0:
+                vecs.append(arr.astype(np.float32).ravel())
+                break   # one layer per step is enough
+
     if not vecs:
         return None
-    return np.mean(vecs, axis=0)
-
-
-def load_concept_vector(vectors_dir: Path, concept: str) -> np.ndarray | None:
-    """Load a single representative steering vector for *concept*."""
-    pkl_path = find_sv_pkl(vectors_dir, concept)
-    if pkl_path is None:
-        print(f"  WARNING: sv.pkl not found for concept '{concept}'", file=sys.stderr)
-        return None
-
-    with open(pkl_path, "rb") as f:
-        sv = pickle.load(f)
-
-    # Try preferred layers
-    for layer in LAYER_PRIORITY:
-        vec = extract_mean_vector(sv, layer)
-        if vec is not None:
-            print(f"  {concept}: loaded from {pkl_path} (layer={layer}, dim={vec.shape[0]})")
-            return vec
-
-    # Fallback: any available layer
-    all_layers = set()
-    for step_dict in sv.values():
-        all_layers.update(step_dict.keys())
-
-    for layer in sorted(all_layers):
-        vec = extract_mean_vector(sv, layer)
-        if vec is not None:
-            print(f"  {concept}: loaded from {pkl_path} (layer={layer} [fallback], dim={vec.shape[0]})")
-            return vec
-
-    print(f"  WARNING: No usable vectors found in {pkl_path}", file=sys.stderr)
-    return None
+    return np.mean(vecs, axis=0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap stability (only if multiple sv.pkl variants available)
+# Discovery
 # ---------------------------------------------------------------------------
 
-
-def bootstrap_stability(
-    vectors_dir: Path,
-    concept: str,
-    n_bootstrap: int = N_BOOTSTRAP,
-    frac: float = BOOTSTRAP_FRAC,
-) -> float | None:
-    """Compute bootstrap cosine-similarity stability for *concept*.
-
-    Looks for multiple sv.pkl files (e.g., different seeds/subsets).
-    Returns mean pairwise cosine similarity across bootstrap vectors,
-    or None if not enough data.
+def discover_concept_files(vectors_dir: Path) -> dict[str, Path]:
     """
-    # Collect all sv.pkl paths mentioning this concept
-    sv_paths = list(vectors_dir.rglob(f"*{concept}*/sv.pkl"))
-    if len(sv_paths) < 2:
-        return None
+    Walk *vectors_dir* recursively.  For each file whose name (or any parent
+    directory name inside vectors_dir) contains a concept substring, record it.
+    Files are filtered to common vector extensions; directories named after a
+    concept are searched for the first loadable file inside them.
+    """
+    EXTENSIONS = {".pkl", ".pt", ".pth", ".npy", ".npz", ""}
 
-    # For each path, extract a mean vector and use it as a "bootstrap replicate"
-    bootstrap_vecs = []
-    for p in sv_paths[:n_bootstrap]:
-        try:
-            with open(p, "rb") as f:
-                sv = pickle.load(f)
-            for layer in LAYER_PRIORITY:
-                vec = extract_mean_vector(sv, layer)
-                if vec is not None:
-                    bootstrap_vecs.append(vec)
-                    break
-        except Exception:
+    print(f"\nScanning {vectors_dir} …")
+    concept_files: dict[str, Path] = {}
+
+    for path in sorted(vectors_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix not in EXTENSIONS:
             continue
 
-    if len(bootstrap_vecs) < 2:
+        size_kb = path.stat().st_size / 1024
+        # Build a searchable string from the path relative to vectors_dir
+        rel = str(path.relative_to(vectors_dir)).lower()
+        print(f"  {path.relative_to(vectors_dir)}  ({size_kb:.1f} KB)")
+
+        for concept in CONCEPTS:
+            if concept in concept_files:
+                continue   # already found one for this concept
+            if concept in rel:
+                concept_files[concept] = path
+                break
+
+    return concept_files
+
+
+# ---------------------------------------------------------------------------
+# Load one concept vector
+# ---------------------------------------------------------------------------
+
+def load_vector(path: Path, concept: str) -> np.ndarray | None:
+    obj, loader = _try_loaders(path)
+    if obj is None:
+        print(f"  ERROR: all loaders failed for {path}", file=sys.stderr)
         return None
 
-    mat = np.stack(bootstrap_vecs)
-    cos_mat = cosine_similarity(mat)
-    # Mean of off-diagonal elements
-    n = len(bootstrap_vecs)
-    off_diag = cos_mat[np.triu_indices(n, k=1)]
-    return float(off_diag.mean())
+    vec = _to_1d_float32(obj)
+    if vec is None:
+        print(f"  ERROR: could not extract 1-D array from {path} (type={type(obj).__name__})",
+              file=sys.stderr)
+        return None
+
+    print(f"  {concept}: loader={loader}, shape={vec.shape}, dtype={vec.dtype}")
+    return vec
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Figure
 # ---------------------------------------------------------------------------
 
+def make_figure(
+    concepts: list[str],
+    cos_sim: np.ndarray,
+    coords_2d: np.ndarray,
+    ev_ratio: np.ndarray,
+    out_dir: Path,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    fig.suptitle("Concept Steering Vector Geometry", fontsize=13, y=1.02)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Concept geometry analysis of CAA steering vectors."
-    )
-    parser.add_argument(
-        "--vectors_dir",
-        type=Path,
-        default=Path("outputs/vectors"),
-        help="Directory containing per-concept sv.pkl files.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=Path,
-        default=Path("results/paper"),
-        help="Output directory for CSV and figure.",
-    )
-    args = parser.parse_args()
-
-    vectors_dir: Path = args.vectors_dir
-    output_dir: Path = args.output_dir
-
-    if not vectors_dir.exists():
-        print(f"ERROR: vectors_dir not found: {vectors_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # 1. Load vectors
-    # ------------------------------------------------------------------
-    print("Loading concept vectors …")
-    concept_vecs: dict[str, np.ndarray] = {}
-    for concept in CONCEPTS:
-        vec = load_concept_vector(vectors_dir, concept)
-        if vec is not None:
-            concept_vecs[concept] = vec
-
-    if len(concept_vecs) < 2:
-        print(
-            "ERROR: fewer than 2 concept vectors loaded. "
-            "Ensure sv.pkl files are present under vectors_dir.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    loaded_concepts = list(concept_vecs.keys())
-    V = np.stack([concept_vecs[c] for c in loaded_concepts])  # (n_concepts, hidden_dim)
-    print(f"\nLoaded {len(loaded_concepts)} concepts: {loaded_concepts}")
-    print(f"Vector shape: {V.shape}\n")
-
-    # ------------------------------------------------------------------
-    # 2. Cosine similarity matrix
-    # ------------------------------------------------------------------
-    cos_sim = cosine_similarity(V)  # (n_concepts, n_concepts)
-
-    # ------------------------------------------------------------------
-    # 3. Vector norms
-    # ------------------------------------------------------------------
-    norms = np.linalg.norm(V, axis=1)
-
-    # ------------------------------------------------------------------
-    # 4. Bootstrap stability
-    # ------------------------------------------------------------------
-    print("Computing bootstrap stability …")
-    stabilities: dict[str, float | None] = {}
-    for concept in loaded_concepts:
-        stab = bootstrap_stability(vectors_dir, concept)
-        if stab is None:
-            print(f"  {concept}: insufficient data for bootstrap, skipping.")
-        stabilities[concept] = stab
-
-    # ------------------------------------------------------------------
-    # 5. PCA
-    # ------------------------------------------------------------------
-    n_components = min(len(loaded_concepts), V.shape[1])
-    pca2 = PCA(n_components=min(2, n_components))
-    coords_2d = pca2.fit_transform(V)
-
-    pca_full = PCA(n_components=n_components)
-    pca_full.fit(V)
-    cum_var = np.cumsum(pca_full.explained_variance_ratio_)
-
-    # Components needed for 90% variance
-    n_for_90 = int(np.searchsorted(cum_var, 0.90)) + 1
-
-    # ------------------------------------------------------------------
-    # 6. Figure — 3 panels
-    # ------------------------------------------------------------------
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle("Concept Steering Vector Geometry", fontsize=14, y=1.01)
-
-    # Panel a: Cosine similarity heatmap
+    # --- Panel 1: cosine similarity heatmap ---
     ax = axes[0]
-    df_cos = pd.DataFrame(cos_sim, index=loaded_concepts, columns=loaded_concepts)
+    df_cos = pd.DataFrame(cos_sim, index=concepts, columns=concepts)
     sns.heatmap(
         df_cos,
         ax=ax,
@@ -278,98 +247,204 @@ def main() -> None:
         square=True,
         cbar_kws={"shrink": 0.8},
     )
-    ax.set_title("(a) Cosine Similarity", fontsize=12)
-    ax.tick_params(axis="x", rotation=45, labelsize=10)
-    ax.tick_params(axis="y", rotation=0, labelsize=10)
+    ax.set_title("Concept vector cosine similarity", fontsize=11)
+    ax.tick_params(axis="x", rotation=45, labelsize=9)
+    ax.tick_params(axis="y", rotation=0, labelsize=9)
 
-    # Panel b: PCA 2D scatter
+    # --- Panel 2: PCA scatter ---
     ax = axes[1]
-    if coords_2d.shape[1] >= 2:
-        xv = pca2.explained_variance_ratio_[0] * 100
-        yv = pca2.explained_variance_ratio_[1] * 100
-        for i, concept in enumerate(loaded_concepts):
-            marker = "X" if concept == "tempo" else "o"
-            ax.scatter(coords_2d[i, 0], coords_2d[i, 1], marker=marker,
-                       s=150, zorder=3, label=concept)
-            ax.annotate(concept, (coords_2d[i, 0], coords_2d[i, 1]),
-                        textcoords="offset points", xytext=(6, 4), fontsize=10)
-        ax.set_xlabel(f"PC1 ({xv:.1f}% var)", fontsize=11)
-        ax.set_ylabel(f"PC2 ({yv:.1f}% var)", fontsize=11)
-        ax.legend(fontsize=9, loc="best")
-    else:
-        ax.text(0.5, 0.5, "Only 1 component\n(need ≥2 concepts)", ha="center", va="center",
-                transform=ax.transAxes, fontsize=11)
-    ax.set_title("(b) PCA 2D Projection", fontsize=12)
-    ax.tick_params(labelsize=10)
+    palette = sns.color_palette("tab10", n_colors=len(concepts))
+    color_map = {c: palette[i] for i, c in enumerate(concepts)}
+    color_map["tempo"] = "crimson"   # distinct color for tempo per spec
 
-    # Panel c: Scree plot
-    ax = axes[2]
-    component_indices = np.arange(1, len(cum_var) + 1)
-    ax.plot(component_indices, cum_var, marker="o", linewidth=2, color="#4C72B0")
-    ax.axhline(0.90, color="red", linestyle="--", linewidth=1.0, label="90% variance")
-    ax.axvline(n_for_90, color="red", linestyle=":", linewidth=1.0,
-               label=f"PC{n_for_90} achieves 90%")
-    ax.set_xlabel("Number of Principal Components", fontsize=11)
-    ax.set_ylabel("Cumulative Explained Variance", fontsize=11)
-    ax.set_title("(c) PCA Scree Plot", fontsize=12)
-    ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=9)
-    ax.tick_params(labelsize=10)
+    if coords_2d.shape[1] >= 2:
+        xv = ev_ratio[0] * 100
+        yv = ev_ratio[1] * 100
+        for i, concept in enumerate(concepts):
+            ax.scatter(
+                coords_2d[i, 0], coords_2d[i, 1],
+                color=color_map[concept],
+                marker="X" if concept == "tempo" else "o",
+                s=160, zorder=3,
+            )
+            ax.annotate(
+                concept,
+                (coords_2d[i, 0], coords_2d[i, 1]),
+                textcoords="offset points",
+                xytext=(6, 4),
+                fontsize=10,
+            )
+        ax.set_xlabel(f"PC1 ({xv:.1f}% var)", fontsize=10)
+        ax.set_ylabel(f"PC2 ({yv:.1f}% var)", fontsize=10)
+        ax.text(
+            0.02, 0.97,
+            f"Explained var: PC1={xv:.1f}%, PC2={yv:.1f}%",
+            transform=ax.transAxes,
+            fontsize=8,
+            va="top",
+            color="gray",
+        )
+    else:
+        ax.text(0.5, 0.5, "Need ≥ 2 concepts for scatter",
+                ha="center", va="center", transform=ax.transAxes)
+    ax.set_title("PCA (PC1 vs PC2)", fontsize=11)
+    ax.tick_params(labelsize=9)
 
     fig.tight_layout()
-    output_dir.joinpath("figures").mkdir(parents=True, exist_ok=True)
-    fig_path = output_dir / "figures" / "concept_geometry.png"
-    fig.savefig(fig_path, dpi=300, bbox_inches="tight")
+    figures_dir = out_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    png_path = figures_dir / "fig2_concept_geometry.png"
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    print(f"Saved figure → {png_path}")
+
+    try:
+        pdf_path = figures_dir / "fig2_concept_geometry.pdf"
+        fig.savefig(pdf_path, bbox_inches="tight")
+        print(f"Saved figure → {pdf_path}")
+    except Exception as exc:
+        warnings.warn(f"PDF save failed ({exc}); PNG still saved.")
+
     plt.close(fig)
-    print(f"Saved figure to {fig_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Concept geometry analysis of CAA steering vectors."
+    )
+    parser.add_argument(
+        "--vectors_dir",
+        type=Path,
+        default=DEFAULT_VECTORS_DIR,
+        help=f"Directory containing per-concept vector files (default: {DEFAULT_VECTORS_DIR})",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Output directory for CSVs and figure (default: {DEFAULT_OUTPUT_DIR})",
+    )
+    args = parser.parse_args()
+
+    vectors_dir: Path = args.vectors_dir
+    output_dir: Path = args.output_dir
+
+    print(f"REPO_ROOT   : {REPO_ROOT}")
+    print(f"vectors_dir : {vectors_dir}")
+    print(f"output_dir  : {output_dir}")
+
+    if not vectors_dir.exists():
+        print(f"\nERROR: vectors_dir not found: {vectors_dir}", file=sys.stderr)
+        sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 7. Save CSV
+    # 1. Discover files
     # ------------------------------------------------------------------
-    tempo_idx = loaded_concepts.index("tempo") if "tempo" in loaded_concepts else None
-    piano_idx = loaded_concepts.index("piano") if "piano" in loaded_concepts else None
-
-    csv_rows = []
-    for i, concept in enumerate(loaded_concepts):
-        csv_rows.append(
-            {
-                "concept": concept,
-                "vector_norm": float(norms[i]),
-                "bootstrap_stability": stabilities.get(concept),
-                "pca_pc1": float(coords_2d[i, 0]) if coords_2d.shape[1] >= 1 else float("nan"),
-                "pca_pc2": float(coords_2d[i, 1]) if coords_2d.shape[1] >= 2 else float("nan"),
-                "cosine_to_tempo": float(cos_sim[i, tempo_idx]) if tempo_idx is not None else float("nan"),
-            }
-        )
-
-    csv_path = output_dir / "concept_geometry.csv"
-    pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
-    print(f"Saved geometry CSV to {csv_path}")
+    concept_files = discover_concept_files(vectors_dir)
+    missing = [c for c in CONCEPTS if c not in concept_files]
+    if missing:
+        print(f"\nERROR: vectors not found for: {missing}", file=sys.stderr)
+        print("Ensure outputs/vectors/ contains files (or sub-dirs) whose names "
+              "include the concept substring.", file=sys.stderr)
+        sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 8. Print summary table
+    # 2. Load vectors
     # ------------------------------------------------------------------
-    print("\n" + "=" * 72)
-    print("CONCEPT GEOMETRY SUMMARY")
-    print("=" * 72)
+    print("\nLoading vectors …")
+    concept_vecs: dict[str, np.ndarray] = {}
+    for concept in CONCEPTS:
+        vec = load_vector(concept_files[concept], concept)
+        if vec is None:
+            print(f"\nERROR: could not load vector for '{concept}'", file=sys.stderr)
+            sys.exit(1)
+        concept_vecs[concept] = vec
 
-    header = f"{'concept':<10} {'norm':>8} {'stability':>11}"
-    for other in loaded_concepts:
-        header += f" {'cos_' + other:>12}"
-    print(header)
-    print("-" * len(header))
+    V = np.stack([concept_vecs[c] for c in CONCEPTS])   # (5, d)
+    print(f"\nMatrix V shape: {V.shape}")
 
-    for i, concept in enumerate(loaded_concepts):
-        stab = stabilities.get(concept)
-        stab_str = f"{stab:.3f}" if stab is not None else "   N/A"
-        row_str = f"{concept:<10} {norms[i]:>8.2f} {stab_str:>11}"
-        for j in range(len(loaded_concepts)):
-            row_str += f" {cos_sim[i, j]:>12.4f}"
-        print(row_str)
+    # ------------------------------------------------------------------
+    # 3. L2 norms
+    # ------------------------------------------------------------------
+    norms = np.linalg.norm(V, axis=1)
+    print("\nL2 norms:")
+    for concept, norm in zip(CONCEPTS, norms):
+        print(f"  {concept:<8} {norm:.4f}")
 
-    print("=" * 72)
-    print(f"\nPCA: {n_for_90} component(s) needed for 90% explained variance")
-    print()
+    # ------------------------------------------------------------------
+    # 4. Cosine similarity matrix
+    # ------------------------------------------------------------------
+    cos_sim = cosine_similarity(V)   # (5, 5)
+
+    df_cos = pd.DataFrame(cos_sim, index=CONCEPTS, columns=CONCEPTS)
+    print("\nCosine similarity matrix:")
+    print(df_cos.round(4).to_string())
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cos_csv = output_dir / "vector_cosine_matrix.csv"
+    df_cos.to_csv(cos_csv)
+    print(f"\nSaved → {cos_csv}")
+
+    # ------------------------------------------------------------------
+    # 5. PCA
+    # ------------------------------------------------------------------
+    n_components = min(3, len(CONCEPTS) - 1)
+    pca = PCA(n_components=n_components)
+    coords = pca.fit_transform(V)    # (5, n_components)
+    ev = pca.explained_variance_ratio_
+
+    print(f"\nPCA explained variance ratios ({n_components} components):")
+    for i, r in enumerate(ev):
+        print(f"  PC{i+1}: {r*100:.2f}%")
+
+    pca_rows = []
+    for i, concept in enumerate(CONCEPTS):
+        row: dict = {"concept": concept}
+        for k in range(n_components):
+            row[f"PC{k+1}"] = float(coords[i, k])
+        for k, r in enumerate(ev):
+            row[f"explained_var_ratio_pc{k+1}"] = float(r)
+        pca_rows.append(row)
+
+    df_pca = pd.DataFrame(pca_rows)
+    pca_csv = output_dir / "vector_pca.csv"
+    df_pca.to_csv(pca_csv, index=False)
+    print(f"Saved → {pca_csv}")
+
+    # ------------------------------------------------------------------
+    # 6. Figure
+    # ------------------------------------------------------------------
+    make_figure(CONCEPTS, cos_sim, coords[:, :2], ev[:2], output_dir)
+
+    # ------------------------------------------------------------------
+    # 7. Textual report
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("CONCEPT GEOMETRY REPORT")
+    print("=" * 60)
+
+    # highest cosine similarity (off-diagonal)
+    cos_off = cos_sim.copy()
+    np.fill_diagonal(cos_off, -np.inf)
+    i, j = np.unravel_index(cos_off.argmax(), cos_off.shape)
+    print(f"Most similar pair  : {CONCEPTS[i]} & {CONCEPTS[j]}  "
+          f"(cosine = {cos_sim[i, j]:.4f})")
+
+    # most orthogonal (closest to 0)
+    cos_abs = np.abs(cos_off)
+    np.fill_diagonal(cos_abs, np.inf)
+    pi, pj = np.unravel_index(cos_abs.argmin(), cos_abs.shape)
+    print(f"Most orthogonal pair: {CONCEPTS[pi]} & {CONCEPTS[pj]}  "
+          f"(cosine = {cos_sim[pi, pj]:.4f})")
+
+    # smallest norm
+    weakest = CONCEPTS[int(norms.argmin())]
+    print(f"Smallest L2 norm   : {weakest}  (norm = {norms.min():.4f})")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
