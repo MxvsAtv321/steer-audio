@@ -4,16 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Title:** "When Does Audio Diffusion Commit? Compositional Concept Steering via Timestep-Aware Activation Algebra"
-**Venue:** ISMIR 2026. Abstract lock: April 20, 2026. Paper deadline: April 27, 2026.
-**Repo:** github.com/MxvsAtv321/steer-audio (fork of luk-st/steer-audio, TADA's repo)
+Research code for analyzing and controlling audio diffusion models (ACE-Step,
+AudioLDM2, Stable Audio) via three core techniques:
 
-Research code for the TADA paper. Analyzes and controls audio diffusion models (ACE-Step, AudioLDM2, Stable Audio) via three core techniques:
 1. **Activation Patching** — localizes where semantic concepts (drums, tempo, mood) are processed
 2. **CAA Steering Vectors** — computes and applies contrastive activation addition vectors at inference time
 3. **Sparse Autoencoders (SAEs)** — learns interpretable feature decompositions of model activations
 
-**Primary finding:** Exp 2 shows concept-dependent commitment timing in audio DiTs, independently validating PCI (Gorgun et al., arXiv:2512.08486, ICLR 2026) which found the same in image diffusion. Key advantage over PCI: internal activations (mechanistic) vs external prompts (behavioral).
+Fork of luk-st/steer-audio at commit `75ff8b9`; see README for provenance.
 
 ## CRITICAL: Never Run Generation Experiments Locally
 
@@ -217,23 +215,12 @@ h_steered_renorm = h_steered * (||h_original|| / ||h_steered||)
 ```
 Implement in `src/models/ace_step/ace_steering/controller.py` as optional flag `--renorm` (default: False for backward compat).
 
-## Correct Citations
-
-- TADA: Staniszewski et al., arXiv:2602.11910, February 2026
-- PCI: Gorgun et al., arXiv:2512.08486, ICLR 2026
-- CaSteer: arXiv:2503.09630 (uses renormalized additive steering, NOT Householder)
-- Linear Representation Hypothesis: Park et al., ICML 2024, arXiv:2311.03658
-- CAE: Hao et al., arXiv:2505.03189, ICLR 2025 Workshop
-- MuQ-Eval: not yet public as of March 2026
-
 ## What NOT to Do
 
 - Do NOT use `torchaudio.load()` (crashes on RunPod)
 - Do NOT call `muq.compute()` (doesn't exist)
 - Do NOT modify `scripts/run_paper_experiments.py` unless fixing a verified bug
 - Do NOT change CSV schemas of existing results files
-- Do NOT post to arXiv before July 10, 2026 (ISMIR notification date)
-- Do NOT use the generic LaTeX article class — use ISMIR 2026 template
 
 ## Working Style for Claude Code
 
@@ -244,8 +231,3 @@ Implement in `src/models/ace_step/ace_steering/controller.py` as optional flag `
 
 When I say "don't ask for clarification for this task," pick the simplest reasonable assumption, document it in a comment or TODO, and continue. Only stop if you hit a hard blocker (missing file, unreadable config, missing dependency).
 
-## Roadmap Integration
-
-There is an additional file, `TADA_Build_Roadmap.md`, that defines detailed multi-week prompts (Phase 1–3).
-
-When I reference a prompt (e.g., "Execute Phase 1, Prompt 1.1"), open `TADA_Build_Roadmap.md`, follow its instructions exactly, apply changes directly without waiting for per-file approval, and summarize files changed + commands to verify at the end.
