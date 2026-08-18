@@ -1,8 +1,8 @@
-# TADA Experiment Results Summary
+# Experiment Results Summary
 
-> Tuning Audio Diffusion Models through Activation Steering (arXiv 2602.11910)
+> Steering Music Generation via Activation Addition (ISMIR 2026)
 >
-> This document summarises all completed experiment results across the TADA roadmap phases.
+> This document summarises completed experiment results across the project's build phases.
 > Results marked **[dry-run / synthetic]** were generated with synthetic activations
 > (real ACE-Step weights require Python 3.10–3.12 + CUDA GPU; see
 > [`docs/scaling_real_runs.md`](scaling_real_runs.md)).
@@ -233,7 +233,7 @@ require ACE-Step weights. Schedule comparison plots are written to `timestep_sch
 
 ---
 
-## Roadmap Phase Coverage
+## Build Phase Coverage
 
 | Phase | Experiment | Status |
 |-------|-----------|--------|
@@ -251,7 +251,7 @@ require ACE-Step weights. Schedule comparison plots are written to `timestep_sch
 
 ---
 
-*Generated as part of TADA roadmap Phase 5.3. See [`docs/scaling_real_runs.md`](scaling_real_runs.md) for instructions on generating real ACE-Step results.*
+*See [`docs/scaling_real_runs.md`](scaling_real_runs.md) for instructions on generating real ACE-Step results.*
 
 ---
 
